@@ -1,0 +1,14 @@
+[Unit]
+Description=VPN Seller Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/vpn-bot
+ExecStart=/usr/bin/python3 /root/vpn-bot/bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
