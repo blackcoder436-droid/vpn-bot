@@ -338,10 +338,13 @@ VALID_CALLBACK_PREFIXES = [
     'key_detail_',
     'exchange_key',
     'exchange_',
+    'exkey_',
+    'expro_',
     'new_proto_',
     'check_usage',
     'usage_',
     'help',
+    'send_screenshot_',
     'confirm_payment_',
     'cancel_order_',
     # Admin callbacks
