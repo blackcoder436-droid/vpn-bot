@@ -6,9 +6,10 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=/root/vpn-bot
-ExecStart=/usr/bin/python3 /root/vpn-bot/bot.py
+ExecStart=/root/vpn-bot/venv/bin/python3 /root/vpn-bot/bot.py
 Restart=always
 RestartSec=10
+Environment=PATH=/root/vpn-bot/venv/bin:/usr/bin:/bin
 
 [Install]
 WantedBy=multi-user.target
