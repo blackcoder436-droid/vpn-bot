@@ -10,9 +10,13 @@ from database import (
     create_order, update_order_screenshot, approve_order, reject_order,
     get_order, save_vpn_key, get_user_keys, get_vpn_key_by_id, update_vpn_key,
     get_sales_stats, get_all_orders, get_expiring_keys, get_all_users,
-    deactivate_vpn_key
+    deactivate_vpn_key, ban_user, unban_user, is_user_banned_db, log_security_event
 )
 from xui_api import create_vpn_key, get_available_protocols, delete_vpn_client, verify_client_exists
+from security import (
+    rate_limiter, InputValidator, is_valid_callback, SecurityLogger,
+    abuse_detector, VALID_CALLBACK_PREFIXES
+)
 
 # Protocol display names
 PROTOCOL_NAMES = {
@@ -38,6 +42,35 @@ user_sessions = {}
 
 # Server status (runtime - disabled servers)
 disabled_servers = set()
+
+# Banned users set
+banned_users = set()
+
+# ===================== SECURITY HELPERS =====================
+
+def check_rate_limit(user_id: int, action_type: str = 'message') -> tuple:
+    """Check rate limit and return (is_allowed, error_message)"""
+    return rate_limiter.check_rate_limit(user_id, action_type)
+
+def is_user_banned(user_id: int) -> bool:
+    """Check if user is banned (runtime or database)"""
+    return user_id in banned_users or rate_limiter.is_banned(user_id) or is_user_banned_db(user_id)
+
+def validate_server_id(server_id: str) -> bool:
+    """Validate server ID"""
+    return server_id in SERVERS
+
+def validate_plan_id(plan_id: str) -> bool:
+    """Validate plan ID"""
+    return plan_id in PLANS
+
+def sanitize_username(username: str) -> str:
+    """Sanitize username for display"""
+    if not username:
+        return "Unknown"
+    # Remove potentially dangerous characters
+    safe_username = re.sub(r'[<>"\']', '', username)
+    return safe_username[:50]  # Limit length
 
 # ===================== KEYBOARDS =====================
 
@@ -187,6 +220,19 @@ def server_management_keyboard():
 def start(message):
     """Start command handler"""
     user = message.from_user
+    user_id = user.id
+    
+    # Security: Check if user is banned
+    if is_user_banned(user_id):
+        bot.reply_to(message, "⚠️ You are temporarily blocked. Please try again later.")
+        return
+    
+    # Security: Rate limiting
+    allowed, error_msg = check_rate_limit(user_id, 'message')
+    if not allowed:
+        bot.reply_to(message, error_msg)
+        return
+    
     create_user(user.id, user.username, user.first_name, user.last_name)
     
     bot.send_message(
@@ -195,17 +241,76 @@ def start(message):
         reply_markup=main_menu_keyboard()
     )
 
+@bot.message_handler(commands=['ban'])
+def ban_command(message):
+    """Ban a user (Admin only)"""
+    user_id = message.from_user.id
+    
+    if user_id != ADMIN_CHAT_ID:
+        return
+    
+    parts = message.text.split(' ', 2)
+    if len(parts) < 2:
+        bot.reply_to(message, "Usage: /ban <user_id> [reason]")
+        return
+    
+    try:
+        target_id = int(parts[1])
+        reason = parts[2] if len(parts) > 2 else "No reason provided"
+    except ValueError:
+        bot.reply_to(message, "❌ Invalid user ID")
+        return
+    
+    if ban_user(target_id, reason):
+        SecurityLogger.log_admin_action(user_id, "ban_user", f"target={target_id}, reason={reason}")
+        bot.reply_to(message, f"✅ User {target_id} has been banned.\nReason: {reason}")
+    else:
+        bot.reply_to(message, f"❌ Failed to ban user {target_id}")
+
+@bot.message_handler(commands=['unban'])
+def unban_command(message):
+    """Unban a user (Admin only)"""
+    user_id = message.from_user.id
+    
+    if user_id != ADMIN_CHAT_ID:
+        return
+    
+    parts = message.text.split(' ', 1)
+    if len(parts) < 2:
+        bot.reply_to(message, "Usage: /unban <user_id>")
+        return
+    
+    try:
+        target_id = int(parts[1])
+    except ValueError:
+        bot.reply_to(message, "❌ Invalid user ID")
+        return
+    
+    if unban_user(target_id):
+        SecurityLogger.log_admin_action(user_id, "unban_user", f"target={target_id}")
+        bot.reply_to(message, f"✅ User {target_id} has been unbanned.")
+    else:
+        bot.reply_to(message, f"❌ Failed to unban user {target_id}")
+
 @bot.message_handler(commands=['admin'])
 def admin_command(message):
     """Admin panel command"""
     user_id = message.from_user.id
     
+    # Security: Rate limiting
+    allowed, error_msg = check_rate_limit(user_id, 'message')
+    if not allowed:
+        return
+    
     logger.info(f"Admin command from user_id: {user_id}, ADMIN_CHAT_ID: {ADMIN_CHAT_ID}")
     
     if user_id != ADMIN_CHAT_ID:
-        bot.reply_to(message, f"❌ Admin only! Your ID: {user_id}")
+        # Security: Log unauthorized access attempt
+        SecurityLogger.log_failed_auth(user_id, "admin_command")
+        bot.reply_to(message, f"❌ Admin only!")
         return
     
+    SecurityLogger.log_admin_action(user_id, "accessed_admin_panel")
     bot.send_message(
         message.chat.id,
         "🔐 *Admin Panel*",
@@ -218,15 +323,28 @@ def broadcast_command(message):
     user_id = message.from_user.id
     
     if user_id != ADMIN_CHAT_ID:
+        SecurityLogger.log_failed_auth(user_id, "broadcast_command")
         return
     
-    # Get message text after /broadcast
+    # Security: Validate input
     text_parts = message.text.split(' ', 1)
     if len(text_parts) < 2:
         bot.reply_to(message, "Usage: /broadcast <message>")
         return
     
     broadcast_message = text_parts[1]
+    
+    # Security: Check for malicious content
+    is_safe, threat_type = InputValidator.is_safe_text(broadcast_message)
+    if not is_safe:
+        bot.reply_to(message, f"⚠️ Message contains potentially unsafe content: {threat_type}")
+        return
+    
+    # Sanitize message
+    broadcast_message = InputValidator.sanitize_text(broadcast_message, max_length=4000)
+    
+    SecurityLogger.log_admin_action(user_id, "broadcast", f"message_length={len(broadcast_message)}")
+    
     users = get_all_users()
     
     sent = 0
@@ -247,6 +365,24 @@ def button_callback(call):
     """Handle button callbacks"""
     user_id = call.from_user.id
     data = call.data
+    
+    # Security: Check if user is banned
+    if is_user_banned(user_id):
+        bot.answer_callback_query(call.id, "⚠️ You are temporarily blocked.", show_alert=True)
+        return
+    
+    # Security: Rate limiting for callbacks
+    allowed, error_msg = check_rate_limit(user_id, 'callback')
+    if not allowed:
+        bot.answer_callback_query(call.id, "⚠️ Too many requests. Please slow down.", show_alert=True)
+        return
+    
+    # Security: Validate callback data
+    if not is_valid_callback(data):
+        SecurityLogger.log_suspicious_activity(user_id, "INVALID_CALLBACK", data[:100])
+        abuse_detector.record_suspicious_activity(user_id, 2)
+        bot.answer_callback_query(call.id, "❌ Invalid action.", show_alert=True)
+        return
     
     bot.answer_callback_query(call.id)
     
@@ -279,6 +415,13 @@ def button_callback(call):
     # Free server selection - now goes to protocol selection
     elif data.startswith("free_server_"):
         server_id = data.replace("free_server_", "")
+        
+        # Security: Validate server_id
+        if not validate_server_id(server_id):
+            SecurityLogger.log_suspicious_activity(user_id, "INVALID_SERVER_ID", server_id)
+            bot.answer_callback_query(call.id, "❌ Invalid server.", show_alert=True)
+            return
+        
         user_sessions[user_id] = {'server_id': server_id, 'is_free': True}
         
         bot.edit_message_text(
@@ -379,6 +522,13 @@ def button_callback(call):
     # Server selected for purchase - go to protocol selection
     elif data.startswith("server_") and not data.startswith("server_selection"):
         server_id = data.replace("server_", "")
+        
+        # Security: Validate server_id
+        if not validate_server_id(server_id):
+            SecurityLogger.log_suspicious_activity(user_id, "INVALID_SERVER_ID", server_id)
+            bot.answer_callback_query(call.id, "❌ Invalid server.", show_alert=True)
+            return
+        
         user_sessions[user_id] = {'server_id': server_id}
         
         bot.edit_message_text(
@@ -426,6 +576,17 @@ def button_callback(call):
         parts = data.split("_")
         server_id = parts[1]
         plan_id = "_".join(parts[2:])
+        
+        # Security: Validate server and plan
+        if not validate_server_id(server_id):
+            SecurityLogger.log_suspicious_activity(user_id, "INVALID_SERVER_ID", server_id)
+            bot.answer_callback_query(call.id, "❌ Invalid server.", show_alert=True)
+            return
+        
+        if not validate_plan_id(plan_id):
+            SecurityLogger.log_suspicious_activity(user_id, "INVALID_PLAN_ID", plan_id)
+            bot.answer_callback_query(call.id, "❌ Invalid plan.", show_alert=True)
+            return
         
         plan = PLANS.get(plan_id)
         if not plan:
@@ -880,12 +1041,22 @@ _Key အသစ်ကို App မှာ ပြန်ထည့်ပါ။_
     elif data.startswith("approve_"):
         # Allow approval from Payment Channel or Admin
         if call.message.chat.id != PAYMENT_CHANNEL_ID and user_id != ADMIN_CHAT_ID:
+            SecurityLogger.log_failed_auth(user_id, "approve_order")
             bot.answer_callback_query(call.id, "❌ Admin only!", show_alert=True)
             return
         
         parts = data.split("_")
-        order_id = int(parts[1])
-        customer_id = int(parts[2])
+        
+        # Security: Validate order_id and customer_id are integers
+        try:
+            order_id = int(parts[1])
+            customer_id = int(parts[2])
+        except (ValueError, IndexError):
+            SecurityLogger.log_suspicious_activity(user_id, "INVALID_APPROVE_DATA", data)
+            bot.answer_callback_query(call.id, "❌ Invalid order data.", show_alert=True)
+            return
+        
+        SecurityLogger.log_admin_action(user_id, "approve_order", f"order_id={order_id}")
         
         # Get order details
         order = get_order(order_id)
@@ -978,12 +1149,22 @@ _Key အသစ်ကို App မှာ ပြန်ထည့်ပါ။_
     elif data.startswith("reject_"):
         # Allow rejection from Payment Channel or Admin
         if call.message.chat.id != PAYMENT_CHANNEL_ID and user_id != ADMIN_CHAT_ID:
+            SecurityLogger.log_failed_auth(user_id, "reject_order")
             bot.answer_callback_query(call.id, "❌ Admin only!", show_alert=True)
             return
         
         parts = data.split("_")
-        order_id = int(parts[1])
-        customer_id = int(parts[2])
+        
+        # Security: Validate order_id and customer_id are integers
+        try:
+            order_id = int(parts[1])
+            customer_id = int(parts[2])
+        except (ValueError, IndexError):
+            SecurityLogger.log_suspicious_activity(user_id, "INVALID_REJECT_DATA", data)
+            bot.answer_callback_query(call.id, "❌ Invalid order data.", show_alert=True)
+            return
+        
+        SecurityLogger.log_admin_action(user_id, "reject_order", f"order_id={order_id}")
         
         reject_order(order_id, user_id)
         
@@ -1118,6 +1299,16 @@ def handle_photo(message):
     """Handle payment screenshots"""
     user_id = message.from_user.id
     
+    # Security: Check if user is banned
+    if is_user_banned(user_id):
+        return
+    
+    # Security: Rate limiting for screenshots
+    allowed, error_msg = check_rate_limit(user_id, 'screenshot')
+    if not allowed:
+        bot.reply_to(message, error_msg)
+        return
+    
     if user_id not in user_sessions or not user_sessions[user_id].get('waiting_screenshot'):
         return
     
@@ -1153,6 +1344,8 @@ def handle_photo(message):
     user = message.from_user
     # Escape special characters in username for Markdown
     username_display = user.username if user.username else user.first_name
+    # Security: Sanitize username
+    username_display = sanitize_username(username_display)
     if username_display:
         username_display = username_display.replace("_", "\\_")
     
@@ -1189,6 +1382,13 @@ def main():
     """Main function to run the bot"""
     # Initialize database
     init_db()
+    
+    # Security initialization
+    print("🔒 Security features enabled:")
+    print("   ├ Rate limiting: ✅")
+    print("   ├ Input validation: ✅")
+    print("   ├ Callback validation: ✅")
+    print("   └ Abuse detection: ✅")
     
     # Start the bot
     print("🚀 VPN Seller Bot started!")

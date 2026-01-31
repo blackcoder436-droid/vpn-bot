@@ -2,14 +2,35 @@
 # VPN Seller Bot Configuration
 # ===========================================
 
-# Telegram Bot Settings
-BOT_TOKEN = "8533001019:AAFpWlhtq8KIne4W0jsH5Oivl8A6tHjmo6g"
-ADMIN_CHAT_ID = 6345824401
-PAYMENT_CHANNEL_ID = -1003830141416  # Payment Proof Channel for approvals
+import os
+from pathlib import Path
 
-# 3x-ui Panel Credentials
-XUI_USERNAME = "Blackcoder"
-XUI_PASSWORD = "Mka@2016"
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    env_path = Path(__file__).parent / '.env'
+    if env_path.exists():
+        load_dotenv(env_path)
+        print("✅ Loaded configuration from .env file")
+except ImportError:
+    print("⚠️ python-dotenv not installed. Using system environment variables.")
+
+# Telegram Bot Settings (from environment variables)
+BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
+ADMIN_CHAT_ID = int(os.environ.get('ADMIN_CHAT_ID', '0'))
+PAYMENT_CHANNEL_ID = int(os.environ.get('PAYMENT_CHANNEL_ID', '0'))
+
+# 3x-ui Panel Credentials (from environment variables)
+XUI_USERNAME = os.environ.get('XUI_USERNAME', '')
+XUI_PASSWORD = os.environ.get('XUI_PASSWORD', '')
+
+# Validate required credentials
+if not BOT_TOKEN:
+    raise ValueError("❌ BOT_TOKEN is required! Set it in .env file.")
+if not ADMIN_CHAT_ID:
+    raise ValueError("❌ ADMIN_CHAT_ID is required! Set it in .env file.")
+if not XUI_USERNAME or not XUI_PASSWORD:
+    raise ValueError("❌ XUI credentials are required! Set them in .env file.")
 
 # Server List
 SERVERS = {
@@ -89,8 +110,8 @@ PAYMENT_INFO = {
     "methods": ["KBZPay", "WavePay", "AYA Pay"]
 }
 
-# Database
-DATABASE_PATH = "vpn_bot.db"
+# Database (from environment variables)
+DATABASE_PATH = os.environ.get('DATABASE_PATH', 'vpn_bot.db')
 
 # Bot Messages (Burmese)
 MESSAGES = {

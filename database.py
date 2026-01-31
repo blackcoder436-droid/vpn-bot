@@ -84,6 +84,18 @@ def init_db():
         )
     ''')
     
+    # Security logs table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS security_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER,
+            event_type TEXT,
+            details TEXT,
+            ip_address TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
     conn.commit()
     conn.close()
     print("✅ Database initialized successfully!")
@@ -330,6 +342,82 @@ def get_sales_stats():
         'active_keys': active_keys,
         'pending_orders': pending_orders
     }
+
+# ===================== SECURITY FUNCTIONS =====================
+
+def ban_user(telegram_id, reason=""):
+    """Ban a user"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    try:
+        cursor.execute('UPDATE users SET is_banned = 1 WHERE telegram_id = ?', (telegram_id,))
+        # Log the ban
+        cursor.execute('''
+            INSERT INTO security_logs (telegram_id, event_type, details)
+            VALUES (?, 'USER_BANNED', ?)
+        ''', (telegram_id, reason))
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"Error banning user: {e}")
+        return False
+    finally:
+        conn.close()
+
+def unban_user(telegram_id):
+    """Unban a user"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    try:
+        cursor.execute('UPDATE users SET is_banned = 0 WHERE telegram_id = ?', (telegram_id,))
+        cursor.execute('''
+            INSERT INTO security_logs (telegram_id, event_type, details)
+            VALUES (?, 'USER_UNBANNED', '')
+        ''', (telegram_id,))
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"Error unbanning user: {e}")
+        return False
+    finally:
+        conn.close()
+
+def is_user_banned_db(telegram_id):
+    """Check if user is banned in database"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    cursor.execute('SELECT is_banned FROM users WHERE telegram_id = ?', (telegram_id,))
+    result = cursor.fetchone()
+    conn.close()
+    return result and result[0] == 1
+
+def log_security_event(telegram_id, event_type, details=""):
+    """Log security event to database"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    try:
+        cursor.execute('''
+            INSERT INTO security_logs (telegram_id, event_type, details)
+            VALUES (?, ?, ?)
+        ''', (telegram_id, event_type, details))
+        conn.commit()
+    except Exception as e:
+        print(f"Error logging security event: {e}")
+    finally:
+        conn.close()
+
+def get_security_logs(limit=100):
+    """Get recent security logs"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT * FROM security_logs 
+        ORDER BY created_at DESC 
+        LIMIT ?
+    ''', (limit,))
+    logs = cursor.fetchall()
+    conn.close()
+    return logs
 
 def get_all_users():
     """Get all users"""
