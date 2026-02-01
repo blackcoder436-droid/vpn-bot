@@ -9,7 +9,7 @@ from config import BOT_TOKEN, ADMIN_CHAT_ID, PAYMENT_CHANNEL_ID, SERVERS, PLANS,
 from database import (
     init_db, create_user, get_user, has_used_free_test, mark_free_test_used,
     create_order, update_order_screenshot, approve_order, reject_order,
-    get_order, save_vpn_key, get_user_keys, get_vpn_key_by_id, update_vpn_key,
+    get_order, get_user_orders, save_vpn_key, get_user_keys, get_vpn_key_by_id, update_vpn_key,
     get_sales_stats, get_all_orders, get_expiring_keys, get_all_users,
     deactivate_vpn_key, ban_user, unban_user, is_user_banned_db, log_security_event,
     # Referral system

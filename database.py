@@ -244,6 +244,33 @@ def get_order(order_id):
     conn.close()
     return order
 
+def get_user_orders(telegram_id, limit=10):
+    """Get recent orders for a user"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT id, server_id, plan_id, amount, status, created_at, screenshot_file_id
+        FROM orders 
+        WHERE telegram_id = ?
+        ORDER BY created_at DESC
+        LIMIT ?
+    ''', (telegram_id, limit))
+    rows = cursor.fetchall()
+    conn.close()
+    
+    orders = []
+    for row in rows:
+        orders.append({
+            'id': row[0],
+            'server_id': row[1],
+            'plan_id': row[2],
+            'amount': row[3],
+            'status': row[4],
+            'created_at': row[5] if isinstance(row[5], (int, float)) else 0,
+            'screenshot_hash': row[6][:20] if row[6] else None  # Use partial file_id as hash
+        })
+    return orders
+
 def save_vpn_key(telegram_id, order_id, server_id, client_email, client_id, sub_link, config_link, data_limit, expiry_date):
     """Save VPN key to database"""
     conn = sqlite3.connect(DATABASE_PATH)
