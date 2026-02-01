@@ -249,7 +249,7 @@ def get_user_orders(telegram_id, limit=10):
     conn = sqlite3.connect(DATABASE_PATH)
     cursor = conn.cursor()
     cursor.execute('''
-        SELECT id, server_id, plan_id, amount, status, created_at, screenshot_file_id
+        SELECT id, server_id, plan_id, amount, status, created_at, payment_screenshot
         FROM orders 
         WHERE telegram_id = ?
         ORDER BY created_at DESC
