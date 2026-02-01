@@ -464,7 +464,7 @@ if __name__ == "__main__":
 # ===================== UNIFIED API =====================
 # Unified interface to support both XUI and Hiddify panels
 
-def create_vpn_key(server_id, telegram_id, username, data_limit, expiry_days, devices, protocol='trojan', key_number=1):
+def create_vpn_key(server_id, telegram_id, username, data_limit_gb=0, expiry_days=30, devices=1, protocol='trojan', key_number=1):
     """Create VPN key - automatically detects panel type"""
     from config import SERVERS
     
@@ -474,16 +474,18 @@ def create_vpn_key(server_id, telegram_id, username, data_limit, expiry_days, de
         return None
     
     panel_type = server.get('panel_type', 'xui')
+    print(f"📡 Creating VPN key on {server['name']} (panel_type: {panel_type})")
     
     if panel_type == 'hiddify':
         from hiddify_api import create_vpn_key_hiddify
-        return create_vpn_key_hiddify(server_id, telegram_id, username, data_limit, expiry_days, devices, key_number)
+        return create_vpn_key_hiddify(server_id, telegram_id, username, data_limit_gb, expiry_days, devices, key_number)
     else:
         # Use XUI
         api = XUIApi(server_id)
         if not api.login():
+            print(f"❌ Failed to login to XUI panel")
             return None
-        return api.create_client(telegram_id, username, data_limit, expiry_days, devices, protocol, key_number=key_number)
+        return api.create_client(telegram_id, username, data_limit_gb, expiry_days, devices, protocol, key_number=key_number)
 
 
 def delete_vpn_client(server_id, client_id):
@@ -535,7 +537,7 @@ def delete_vpn_client(server_id, client_id):
 
 
 def verify_client_exists(server_id, client_id):
-    """Verify if client exists - automatically detects panel type"""
+    """Verify if client exists and return client info - automatically detects panel type"""
     from config import SERVERS
     
     server = SERVERS.get(server_id)
@@ -548,7 +550,7 @@ def verify_client_exists(server_id, client_id):
         from hiddify_api import verify_user_exists_hiddify
         return verify_user_exists_hiddify(server_id, client_id)
     else:
-        # Use XUI - existing implementation
+        # Use XUI - return client info dictionary
         api = XUIApi(server_id)
         if not api.login():
             return False
@@ -564,7 +566,11 @@ def verify_client_exists(server_id, client_id):
             for client in clients:
                 client_uuid = client.get('id') or client.get('password')
                 if client_uuid == client_id or client.get('email') == client_id:
-                    return True
+                    # Return dictionary with client and inbound info
+                    return {
+                        'client': client,
+                        'inbound': inbound
+                    }
         
         return False
 

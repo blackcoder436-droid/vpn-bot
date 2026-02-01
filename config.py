@@ -65,14 +65,15 @@ SERVERS = {
         "panel_type": "xui"
     },
     "hiddify1": {
-        "name": "🌐 Hiddify Main",
+        "name": "🌐 Hiddify Key",
         "url": "https://main.burmesedigital.store",
-        "panel_path": "SeS1TFUTYLdZXv7F",
+        "panel_path": "SeS1TFUTYLdZXv7F",  # Admin panel path (for API)
         "domain": "main.burmesedigital.store",
         "panel_type": "hiddify",
         "api_key": HIDDIFY_API_KEY if HIDDIFY_API_KEY else "c0ac46c4-7da2-44cd-89e8-be68e24ba01b",
         "admin_uuid": HIDDIFY_ADMIN_UUID if HIDDIFY_ADMIN_UUID else "c0ac46c4-7da2-44cd-89e8-be68e24ba01b",
-        "proxy_path": "SeS1TFUTYLdZXv7F"
+        "proxy_path": "SeS1TFUTYLdZXv7F",  # Admin proxy path (for API)
+        "user_sub_path": "JFpw0BGULh0DRp"  # User subscription path (for client apps)
     }
 }
 
@@ -126,7 +127,7 @@ PLANS = {
 PAYMENT_INFO = {
     "name": "Myo Ko Aung",
     "phone": "09950569539",
-    "methods": ["KBZPay", "WavePay", "AYA Pay"]
+    "methods": ["KBZPay", "WavePay", "AYA Pay", "UAB Pay"]
 }
 
 # Database (from environment variables)
@@ -174,7 +175,8 @@ _ကာလ ကြာကြာ ဝယ်လေ စျေးသက်သာလေ_
 *Payment Methods:*
 ├ KBZPay ✅
 ├ WavePay ✅
-└ AYA Pay ✅
+├ AYA Pay ✅
+└ UAB Pay ✅
 
 ⚠️ *အရေးကြီး သတိပေးချက်*
 ငွေလွှဲသည့်အခါ မှတ်ချက် (Note) တွင် "VPN" နှင့် သက်ဆိုင်သော စာသားများ *လုံးဝ မရေးပါနဲ့*!

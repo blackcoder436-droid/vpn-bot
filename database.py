@@ -96,6 +96,46 @@ def init_db():
         )
     ''')
     
+    # Referral system tables
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS referrals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            referrer_id INTEGER NOT NULL,
+            referred_id INTEGER UNIQUE NOT NULL,
+            referred_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            is_paid INTEGER DEFAULT 0,
+            paid_at TIMESTAMP,
+            order_id INTEGER,
+            FOREIGN KEY (referrer_id) REFERENCES users(telegram_id),
+            FOREIGN KEY (referred_id) REFERENCES users(telegram_id)
+        )
+    ''')
+    
+    # Referral rewards tracking
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS referral_rewards (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER NOT NULL,
+            reward_type TEXT NOT NULL,
+            reward_value TEXT,
+            referral_count INTEGER,
+            claimed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (telegram_id) REFERENCES users(telegram_id)
+        )
+    ''')
+    
+    # Add referral bonus data to users (5 Days per referral)
+    try:
+        cursor.execute('ALTER TABLE users ADD COLUMN referral_bonus_days INTEGER DEFAULT 0')
+    except:
+        pass  # Column already exists
+    
+    # Add referral code to users
+    try:
+        cursor.execute('ALTER TABLE users ADD COLUMN referral_code TEXT')
+    except:
+        pass  # Column already exists
+
     conn.commit()
     conn.close()
     print("✅ Database initialized successfully!")
@@ -292,6 +332,50 @@ def get_expiring_keys(days=3):
     conn.close()
     return keys
 
+def get_user_active_keys(telegram_id):
+    """Get user's active keys with server info"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT id, server_id, client_id, expiry_date FROM vpn_keys 
+        WHERE telegram_id = ? AND is_active = 1
+        ORDER BY expiry_date DESC
+    ''', (telegram_id,))
+    keys = cursor.fetchall()
+    conn.close()
+    return keys
+
+def extend_key_expiry(key_id, days):
+    """Extend VPN key expiry by specified days"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    try:
+        # Get current expiry
+        cursor.execute('SELECT expiry_date FROM vpn_keys WHERE id = ?', (key_id,))
+        result = cursor.fetchone()
+        if not result:
+            conn.close()
+            return None
+        
+        current_expiry = result[0]
+        if isinstance(current_expiry, str):
+            current_expiry = datetime.strptime(current_expiry, '%Y-%m-%d %H:%M:%S')
+        
+        # Calculate new expiry
+        new_expiry = current_expiry + timedelta(days=days)
+        
+        # Update in database
+        cursor.execute('''
+            UPDATE vpn_keys SET expiry_date = ? WHERE id = ?
+        ''', (new_expiry, key_id))
+        conn.commit()
+        conn.close()
+        return new_expiry
+    except Exception as e:
+        print(f"Error extending key expiry: {e}")
+        conn.close()
+        return None
+
 def get_all_orders(status=None):
     """Get all orders, optionally filtered by status"""
     conn = sqlite3.connect(DATABASE_PATH)
@@ -427,6 +511,245 @@ def get_all_users():
     users = cursor.fetchall()
     conn.close()
     return users
+
+# ===================== REFERRAL SYSTEM =====================
+
+def generate_referral_code(telegram_id):
+    """Generate unique referral code for user"""
+    import hashlib
+    # Create a unique code based on telegram_id
+    hash_input = f"{telegram_id}_vpnbot_ref"
+    code = hashlib.md5(hash_input.encode()).hexdigest()[:8].upper()
+    
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    cursor.execute('UPDATE users SET referral_code = ? WHERE telegram_id = ?', (code, telegram_id))
+    conn.commit()
+    conn.close()
+    return code
+
+def get_referral_code(telegram_id):
+    """Get user's referral code"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    cursor.execute('SELECT referral_code FROM users WHERE telegram_id = ?', (telegram_id,))
+    result = cursor.fetchone()
+    conn.close()
+    
+    if result and result[0]:
+        return result[0]
+    else:
+        # Generate new code if doesn't exist
+        return generate_referral_code(telegram_id)
+
+def get_user_by_referral_code(code):
+    """Get user by their referral code"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    cursor.execute('SELECT telegram_id FROM users WHERE referral_code = ?', (code.upper(),))
+    result = cursor.fetchone()
+    conn.close()
+    return result[0] if result else None
+
+def add_referral(referrer_id, referred_id):
+    """Add a new referral relationship"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    
+    # Check if user is already referred by someone
+    cursor.execute('SELECT id FROM referrals WHERE referred_id = ?', (referred_id,))
+    if cursor.fetchone():
+        conn.close()
+        return False, "already_referred"
+    
+    # Check self-referral
+    if referrer_id == referred_id:
+        conn.close()
+        return False, "self_referral"
+    
+    try:
+        cursor.execute('''
+            INSERT INTO referrals (referrer_id, referred_id)
+            VALUES (?, ?)
+        ''', (referrer_id, referred_id))
+        conn.commit()
+        conn.close()
+        return True, "success"
+    except Exception as e:
+        conn.close()
+        return False, str(e)
+
+def mark_referral_paid(referred_id, order_id):
+    """Mark referral as paid when referred user makes a purchase"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    
+    # Get the referral record
+    cursor.execute('''
+        SELECT id, referrer_id, is_paid FROM referrals 
+        WHERE referred_id = ? AND is_paid = 0
+    ''', (referred_id,))
+    referral = cursor.fetchone()
+    
+    if not referral:
+        conn.close()
+        return None  # No unpaid referral found
+    
+    referral_id, referrer_id, is_paid = referral
+    
+    # Mark as paid
+    cursor.execute('''
+        UPDATE referrals SET is_paid = 1, paid_at = ?, order_id = ?
+        WHERE id = ?
+    ''', (datetime.now(), order_id, referral_id))
+    
+    # Add 5 Days bonus to referrer
+    cursor.execute('''
+        UPDATE users SET referral_bonus_days = COALESCE(referral_bonus_days, 0) + 5
+        WHERE telegram_id = ?
+    ''', (referrer_id,))
+    
+    conn.commit()
+    conn.close()
+    
+    return referrer_id
+
+def get_referral_stats(telegram_id):
+    """Get referral statistics for a user"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    
+    # Total referred users (signed up through link)
+    cursor.execute('''
+        SELECT COUNT(*) FROM referrals WHERE referrer_id = ?
+    ''', (telegram_id,))
+    total_referred = cursor.fetchone()[0]
+    
+    # Paid referrals (referred users who made a purchase)
+    cursor.execute('''
+        SELECT COUNT(*) FROM referrals WHERE referrer_id = ? AND is_paid = 1
+    ''', (telegram_id,))
+    paid_referrals = cursor.fetchone()[0]
+    
+    # Get bonus Days
+    cursor.execute('''
+        SELECT COALESCE(referral_bonus_days, 0) FROM users WHERE telegram_id = ?
+    ''', (telegram_id,))
+    bonus_days = cursor.fetchone()[0] or 0
+    
+    # Get claimed free months
+    cursor.execute('''
+        SELECT COUNT(*) FROM referral_rewards 
+        WHERE telegram_id = ? AND reward_type = 'free_month'
+    ''', (telegram_id,))
+    claimed_free_months = cursor.fetchone()[0]
+    
+    conn.close()
+    
+    return {
+        'total_referred': total_referred,
+        'paid_referrals': paid_referrals,
+        'bonus_days': bonus_days,
+        'claimed_free_months': claimed_free_months,
+        'can_claim_free_month': paid_referrals >= 3 and paid_referrals // 3 > claimed_free_months
+    }
+
+def claim_free_month_reward(telegram_id):
+    """Claim free month reward for 3 paid referrals"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    
+    # Check eligibility
+    stats = get_referral_stats(telegram_id)
+    if not stats['can_claim_free_month']:
+        conn.close()
+        return False, "not_eligible"
+    
+    try:
+        cursor.execute('''
+            INSERT INTO referral_rewards (telegram_id, reward_type, reward_value, referral_count)
+            VALUES (?, 'free_month', '1 month free key', ?)
+        ''', (telegram_id, stats['paid_referrals']))
+        conn.commit()
+        conn.close()
+        return True, "success"
+    except Exception as e:
+        conn.close()
+        return False, str(e)
+
+def get_referrer_id(referred_id):
+    """Get the referrer ID for a user"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    cursor.execute('SELECT referrer_id FROM referrals WHERE referred_id = ?', (referred_id,))
+    result = cursor.fetchone()
+    conn.close()
+    return result[0] if result else None
+
+def use_bonus_days(telegram_id, days_amount):
+    """Use bonus Days from referral rewards"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT referral_bonus_days FROM users WHERE telegram_id = ?', (telegram_id,))
+    current_bonus = cursor.fetchone()[0] or 0
+    
+    if current_bonus < days_amount:
+        conn.close()
+        return False
+    
+    cursor.execute('''
+        UPDATE users SET referral_bonus_days = referral_bonus_days - ?
+        WHERE telegram_id = ?
+    ''', (days_amount, telegram_id))
+    conn.commit()
+    conn.close()
+    return True
+
+def get_referred_users_details(referrer_id):
+    """Get detailed list of referred users with their order info"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    
+    # Get all referrals with user info and order details
+    cursor.execute('''
+        SELECT 
+            r.referred_id,
+            r.referred_at,
+            r.is_paid,
+            r.paid_at,
+            r.order_id,
+            u.username,
+            u.first_name,
+            o.plan_id,
+            o.amount,
+            o.status
+        FROM referrals r
+        LEFT JOIN users u ON r.referred_id = u.telegram_id
+        LEFT JOIN orders o ON r.order_id = o.id
+        WHERE r.referrer_id = ?
+        ORDER BY r.referred_at DESC
+    ''', (referrer_id,))
+    
+    results = cursor.fetchall()
+    conn.close()
+    
+    referred_users = []
+    for row in results:
+        referred_users.append({
+            'user_id': row[0],
+            'referred_at': row[1],
+            'is_paid': row[2],
+            'paid_at': row[3],
+            'order_id': row[4],
+            'username': row[5],
+            'first_name': row[6],
+            'plan_id': row[7],
+            'amount': row[8],
+            'order_status': row[9]
+        })
+    
+    return referred_users
 
 if __name__ == "__main__":
     init_db()

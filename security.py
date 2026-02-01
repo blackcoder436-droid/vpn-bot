@@ -1,14 +1,16 @@
 # ===========================================
 # Security Module for VPN Bot
+# Enhanced DDoS Protection, Prompt Injection Defense
 # ===========================================
 
 import time
 import re
 import hashlib
 import logging
+import threading
 from functools import wraps
 from collections import defaultdict
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
@@ -16,25 +18,37 @@ logger = logging.getLogger(__name__)
 # ===================== RATE LIMITING =====================
 
 class RateLimiter:
-    """Rate limiter to prevent spam and abuse"""
+    """Enhanced rate limiter to prevent spam, DDoS and abuse"""
     
     def __init__(self):
         # Store: {user_id: [(timestamp, action_type), ...]}
         self.user_actions: Dict[int, list] = defaultdict(list)
         self.banned_users: Dict[int, datetime] = {}  # Temporary bans
+        self.ip_tracking: Dict[str, list] = defaultdict(list)  # IP-based tracking
+        self.global_request_count = 0
+        self.global_request_window_start = time.time()
+        self._lock = threading.Lock()
         
-        # Rate limits configuration
+        # Rate limits configuration - Stricter limits for DDoS protection
         self.limits = {
-            'message': {'count': 30, 'period': 60},      # 30 messages per minute
-            'callback': {'count': 60, 'period': 60},     # 60 callbacks per minute
+            'message': {'count': 20, 'period': 60},      # 20 messages per minute
+            'callback': {'count': 40, 'period': 60},     # 40 callbacks per minute
             'free_test': {'count': 1, 'period': 86400},  # 1 free test per day
-            'order': {'count': 10, 'period': 3600},      # 10 orders per hour
-            'screenshot': {'count': 5, 'period': 300},   # 5 screenshots per 5 minutes
+            'order': {'count': 5, 'period': 3600},       # 5 orders per hour
+            'screenshot': {'count': 3, 'period': 300},   # 3 screenshots per 5 minutes
+            'referral': {'count': 10, 'period': 3600},   # 10 referral actions per hour
+            'admin': {'count': 100, 'period': 60},       # Admin has higher limits
         }
         
+        # DDoS Protection settings
+        self.global_limit = 1000          # Max global requests per minute
+        self.burst_limit = 50             # Max burst requests per second
+        self.burst_window = []            # Track burst requests
+        
         # Ban thresholds
-        self.spam_threshold = 100  # Actions in 60 seconds to trigger ban
-        self.ban_duration = 300    # 5 minutes ban
+        self.spam_threshold = 80          # Actions in 60 seconds to trigger ban
+        self.ban_duration = 600           # 10 minutes ban (increased from 5)
+        self.severe_ban_duration = 3600   # 1 hour for severe violations
         
     def _cleanup_old_actions(self, user_id: int, period: int):
         """Remove actions older than the specified period"""
@@ -53,15 +67,50 @@ class RateLimiter:
                 del self.banned_users[user_id]
         return False
     
+    def ban_user(self, user_id: int, duration: int = None, reason: str = "rate_limit"):
+        """Ban a user temporarily"""
+        if duration is None:
+            duration = self.ban_duration
+        self.banned_users[user_id] = datetime.now() + timedelta(seconds=duration)
+        logger.warning(f"User {user_id} banned for {duration}s - Reason: {reason}")
+    
+    def check_ddos_protection(self) -> bool:
+        """Check global rate limits for DDoS protection"""
+        with self._lock:
+            current_time = time.time()
+            
+            # Check burst protection (requests per second)
+            self.burst_window = [t for t in self.burst_window if current_time - t < 1]
+            if len(self.burst_window) >= self.burst_limit:
+                logger.critical(f"DDOS ALERT: Burst limit exceeded - {len(self.burst_window)} req/sec")
+                return False
+            self.burst_window.append(current_time)
+            
+            # Check global rate (requests per minute)
+            if current_time - self.global_request_window_start > 60:
+                self.global_request_count = 0
+                self.global_request_window_start = current_time
+            
+            self.global_request_count += 1
+            if self.global_request_count > self.global_limit:
+                logger.critical(f"DDOS ALERT: Global limit exceeded - {self.global_request_count} req/min")
+                return False
+            
+            return True
+    
     def check_rate_limit(self, user_id: int, action_type: str = 'message') -> tuple[bool, str]:
         """
         Check if user has exceeded rate limit
         Returns: (is_allowed, error_message)
         """
+        # Check global DDoS protection first
+        if not self.check_ddos_protection():
+            return False, "⚠️ Server is busy. Please try again later."
+        
         # Check if user is banned
         if self.is_banned(user_id):
             remaining = (self.banned_users[user_id] - datetime.now()).seconds
-            return False, f"⚠️ You are temporarily blocked. Please wait {remaining} seconds."
+            return False, f"⚠️ သင် ယာယီ block ခံထားရပါသည်။ {remaining} စက္ကန့် စောင့်ပါ။"
         
         current_time = time.time()
         
@@ -81,13 +130,12 @@ class RateLimiter:
         total_actions = len(self.user_actions[user_id])
         if total_actions >= self.spam_threshold:
             # Ban user temporarily
-            self.banned_users[user_id] = datetime.now() + timedelta(seconds=self.ban_duration)
-            logger.warning(f"User {user_id} banned for spam: {total_actions} actions in 60s")
-            return False, "⚠️ Too many requests! You are temporarily blocked for 5 minutes."
+            self.ban_user(user_id, self.severe_ban_duration, "spam_detected")
+            return False, "⚠️ Request များ အများကြီး ပို့နေပါသည်! 1 နာရီ ယာယီ block ခံရပါမည်။"
         
         # Check specific rate limit
         if action_count >= limit_config['count']:
-            return False, f"⚠️ Rate limit exceeded. Please wait before trying again."
+            return False, f"⚠️ Rate limit ကျော်နေပါသည်။ ခဏနေ ပြန်စမ်းပါ။"
         
         # Record this action
         self.user_actions[user_id].append((current_time, action_type))
@@ -97,7 +145,7 @@ class RateLimiter:
 # ===================== INPUT VALIDATION =====================
 
 class InputValidator:
-    """Validate and sanitize user inputs"""
+    """Enhanced validation and sanitization for user inputs - Protects against prompt injection"""
     
     # Dangerous patterns that could indicate injection attempts
     DANGEROUS_PATTERNS = [
@@ -111,15 +159,32 @@ class InputValidator:
         r'__proto__',
         r'constructor',
         r'prototype',
+        r'<iframe',
+        r'<object',
+        r'<embed',
+        r'<form',
+        r'<input',
+        r'document\.',
+        r'window\.',
+        r'localStorage',
+        r'sessionStorage',
+        r'cookie',
     ]
     
     # SQL injection patterns
     SQL_PATTERNS = [
         r"('|\")\s*(or|and)\s*('|\"|\d)",
-        r";\s*(drop|delete|update|insert|alter)",
-        r"union\s+select",
+        r";\s*(drop|delete|update|insert|alter|truncate|create)",
+        r"union\s+(all\s+)?select",
         r"--\s*$",
         r"/\*.*\*/",
+        r"xp_",
+        r"sp_",
+        r"0x[0-9a-fA-F]+",
+        r"char\s*\(",
+        r"concat\s*\(",
+        r"benchmark\s*\(",
+        r"sleep\s*\(",
     ]
     
     # Command injection patterns
@@ -132,18 +197,77 @@ class InputValidator:
         r'`.*`',
         r'\beval\b',
         r'\bexec\b',
+        r'\bsystem\b',
+        r'\bos\.',
+        r'\bsubprocess',
+        r'import\s+os',
+        r'import\s+subprocess',
+        r'__import__',
+        r'open\s*\(',
+        r'read\s*\(',
+        r'write\s*\(',
+    ]
+    
+    # Prompt injection patterns (for AI/bot protection)
+    PROMPT_INJECTION_PATTERNS = [
+        r'ignore\s+(previous|all|above)\s+instructions?',
+        r'disregard\s+(previous|all|above)',
+        r'forget\s+(previous|all|everything)',
+        r'you\s+are\s+now\s+',
+        r'pretend\s+(to\s+be|you\s+are)',
+        r'act\s+as\s+(if|a)',
+        r'new\s+instructions?:',
+        r'override\s+(previous|system)',
+        r'system\s*:\s*',
+        r'assistant\s*:\s*',
+        r'human\s*:\s*',
+        r'user\s*:\s*',
+        r'admin\s*:\s*',
+        r'\[system\]',
+        r'\[admin\]',
+        r'jailbreak',
+        r'bypass\s+(filter|security|restriction)',
+        r'reveal\s+(secret|password|key|api)',
+        r'show\s+me\s+(the\s+)?(secret|password|config)',
+        r'what\s+is\s+(your|the)\s+(password|api\s*key|secret)',
+        r'give\s+me\s+(admin|root)\s+access',
+        r'execute\s+(this\s+)?command',
+        r'run\s+(this\s+)?code',
+        r'sudo\s+',
+        r'as\s+root',
+        r'with\s+elevated\s+privileges',
+    ]
+    
+    # Path traversal patterns
+    PATH_TRAVERSAL_PATTERNS = [
+        r'\.\.',
+        r'%2e%2e',
+        r'%252e',
+        r'\.\./',
+        r'\.\.\\\\',
+        r'/etc/',
+        r'/proc/',
+        r'/sys/',
+        r'c:\\\\',
+        r'\\\\windows',
     ]
     
     @classmethod
     def is_safe_text(cls, text: str) -> tuple[bool, str]:
         """
-        Check if text is safe from injection attacks
+        Check if text is safe from all injection attacks
         Returns: (is_safe, threat_type)
         """
         if not text:
             return True, ""
         
         text_lower = text.lower()
+        
+        # Check prompt injection (highest priority for bots)
+        for pattern in cls.PROMPT_INJECTION_PATTERNS:
+            if re.search(pattern, text_lower, re.IGNORECASE):
+                logger.warning(f"Prompt injection attempt detected: {pattern}")
+                return False, "prompt_injection"
         
         # Check dangerous patterns
         for pattern in cls.DANGEROUS_PATTERNS:
@@ -160,6 +284,19 @@ class InputValidator:
             if re.search(pattern, text):
                 return False, "command_injection"
         
+        # Check path traversal
+        for pattern in cls.PATH_TRAVERSAL_PATTERNS:
+            if re.search(pattern, text_lower, re.IGNORECASE):
+                return False, "path_traversal"
+        
+        # Check for excessive length (potential buffer overflow)
+        if len(text) > 4096:
+            return False, "excessive_length"
+        
+        # Check for null bytes
+        if '\x00' in text:
+            return False, "null_byte_injection"
+        
         return True, ""
     
     @classmethod
@@ -171,7 +308,10 @@ class InputValidator:
         # Truncate to max length
         text = text[:max_length]
         
-        # Remove control characters
+        # Remove null bytes
+        text = text.replace('\x00', '')
+        
+        # Remove control characters (except newline and tab)
         text = ''.join(char for char in text if ord(char) >= 32 or char in '\n\t')
         
         # Escape HTML special characters
@@ -180,8 +320,20 @@ class InputValidator:
         text = text.replace('>', '&gt;')
         text = text.replace('"', '&quot;')
         text = text.replace("'", '&#x27;')
+        text = text.replace('/', '&#x2F;')
+        text = text.replace('\\', '&#x5C;')
         
         return text.strip()
+    
+    @classmethod
+    def sanitize_username(cls, username: str) -> str:
+        """Sanitize username - only allow safe characters"""
+        if not username:
+            return ""
+        
+        # Only allow alphanumeric, underscore
+        sanitized = re.sub(r'[^\w]', '', username)
+        return sanitized[:64]  # Max 64 chars
     
     @classmethod
     def validate_callback_data(cls, data: str, allowed_prefixes: list) -> bool:
@@ -189,9 +341,17 @@ class InputValidator:
         if not data:
             return False
         
+        # Check length
+        if len(data) > 64:
+            return False
+        
+        # Check for dangerous characters
+        if any(c in data for c in ['<', '>', '"', "'", ';', '|', '&']):
+            return False
+        
         # Check if callback starts with allowed prefix
         for prefix in allowed_prefixes:
-            if data.startswith(prefix):
+            if data.startswith(prefix) or data == prefix.rstrip('_'):
                 return True
         
         return False
@@ -347,8 +507,15 @@ VALID_CALLBACK_PREFIXES = [
     'send_screenshot_',
     'confirm_payment_',
     'cancel_order_',
+    # Referral callbacks
+    'referral',
+    'my_referral_link',
+    'referral_stats',
+    'claim_free_month',
     # Admin callbacks
     'admin_',
+    'approve_freekey_',  # MUST be before 'approve_'
+    'reject_freekey_',   # MUST be before 'reject_'
     'approve_',
     'reject_',
     'toggle_server_',
@@ -362,42 +529,195 @@ def is_valid_callback(callback_data: str) -> bool:
 # ===================== ANTI-ABUSE MEASURES =====================
 
 class AbuseDetector:
-    """Detect and prevent abuse patterns"""
+    """Enhanced abuse detection and prevention"""
     
     def __init__(self):
-        self.suspicious_users: Dict[int, int] = defaultdict(int)  # user_id: suspicion_score
+        self._lock = threading.Lock()
+        self.suspicious_users: Dict[int, dict] = defaultdict(lambda: {
+            'score': 0,
+            'last_activity': 0,
+            'activities': [],
+            'warnings': 0
+        })
+        self.blocked_users: Dict[int, float] = {}  # user_id: block_until_timestamp
+        
+        # Thresholds
         self.suspicion_threshold = 10
+        self.warning_threshold = 3  # Warnings before block
+        self.block_duration = 3600  # 1 hour block
+        self.severe_block_duration = 86400  # 24 hour block for severe abuse
         
-    def record_suspicious_activity(self, user_id: int, severity: int = 1):
-        """Record suspicious activity and increase suspicion score"""
-        self.suspicious_users[user_id] += severity
+        # Activity history limit
+        self.max_activity_history = 50
         
-        if self.suspicious_users[user_id] >= self.suspicion_threshold:
+        # Abuse patterns config
+        self.abuse_patterns = {
+            'rapid_orders': {'count': 5, 'window': 60, 'severity': 3},
+            'failed_payments': {'count': 3, 'window': 300, 'severity': 4},
+            'injection_attempts': {'count': 2, 'window': 600, 'severity': 8},
+            'spam_messages': {'count': 10, 'window': 30, 'severity': 5},
+            'invalid_callbacks': {'count': 5, 'window': 60, 'severity': 3},
+        }
+    
+    def is_user_blocked(self, user_id: int) -> bool:
+        """Check if user is currently blocked"""
+        with self._lock:
+            if user_id in self.blocked_users:
+                if time.time() < self.blocked_users[user_id]:
+                    return True
+                else:
+                    del self.blocked_users[user_id]
+            return False
+    
+    def block_user(self, user_id: int, duration: int = None, reason: str = "abuse"):
+        """Block a user for specified duration"""
+        with self._lock:
+            block_time = duration or self.block_duration
+            self.blocked_users[user_id] = time.time() + block_time
             SecurityLogger.log_suspicious_activity(
                 user_id, 
-                "HIGH_SUSPICION_SCORE",
-                f"Score: {self.suspicious_users[user_id]}"
+                f"USER_BLOCKED",
+                f"Duration: {block_time}s, Reason: {reason}"
             )
-            return True  # User should be reviewed
-        return False
     
-    def check_order_pattern(self, user_id: int, recent_orders: list) -> bool:
+    def record_suspicious_activity(self, user_id: int, activity_type: str, severity: int = 1) -> tuple[bool, str]:
+        """
+        Record suspicious activity and increase suspicion score
+        Returns: (should_block, action_taken)
+        """
+        with self._lock:
+            current_time = time.time()
+            user_data = self.suspicious_users[user_id]
+            
+            # Add activity to history
+            user_data['activities'].append({
+                'type': activity_type,
+                'time': current_time,
+                'severity': severity
+            })
+            
+            # Trim old activities
+            if len(user_data['activities']) > self.max_activity_history:
+                user_data['activities'] = user_data['activities'][-self.max_activity_history:]
+            
+            # Update score (decay over time)
+            time_since_last = current_time - user_data['last_activity']
+            if time_since_last > 3600:  # Reduce score after 1 hour of inactivity
+                user_data['score'] = max(0, user_data['score'] - 3)
+            
+            user_data['score'] += severity
+            user_data['last_activity'] = current_time
+            
+            # Log the activity
+            SecurityLogger.log_suspicious_activity(user_id, activity_type, f"Severity: {severity}, Total Score: {user_data['score']}")
+            
+            # Check if user should be blocked
+            if user_data['score'] >= self.suspicion_threshold:
+                user_data['warnings'] += 1
+                
+                if user_data['warnings'] >= self.warning_threshold:
+                    # Severe block for repeated offenders
+                    self.blocked_users[user_id] = current_time + self.severe_block_duration
+                    return True, f"severe_block_{self.severe_block_duration}s"
+                else:
+                    # Regular block
+                    self.blocked_users[user_id] = current_time + self.block_duration
+                    user_data['score'] = 0  # Reset score but keep warnings
+                    return True, f"blocked_{self.block_duration}s"
+            
+            return False, "recorded"
+    
+    def check_injection_attempt(self, user_id: int, threat_type: str) -> tuple[bool, str]:
+        """Record injection attempts - severe penalty"""
+        severity_map = {
+            'prompt_injection': 8,
+            'sql_injection': 7,
+            'command_injection': 9,
+            'path_traversal': 6,
+            'dangerous_pattern': 5,
+            'null_byte_injection': 6,
+        }
+        severity = severity_map.get(threat_type, 5)
+        return self.record_suspicious_activity(user_id, f"INJECTION_{threat_type.upper()}", severity)
+    
+    def check_order_pattern(self, user_id: int, recent_orders: list) -> tuple[bool, str]:
         """Check for suspicious order patterns"""
         if not recent_orders:
-            return False
+            return False, ""
         
-        # Too many failed orders
-        failed_count = sum(1 for order in recent_orders if order.get('status') == 'rejected')
-        if failed_count >= 5:
-            self.record_suspicious_activity(user_id, 3)
-            return True
+        with self._lock:
+            current_time = time.time()
+            
+            # Count failed orders in last hour
+            failed_count = sum(
+                1 for order in recent_orders 
+                if order.get('status') == 'rejected' 
+                and (current_time - order.get('created_at', 0)) < 3600
+            )
+            
+            if failed_count >= 5:
+                return self.record_suspicious_activity(user_id, "EXCESSIVE_FAILED_ORDERS", 4)
+            
+            # Check for rapid order creation
+            recent_count = sum(
+                1 for order in recent_orders 
+                if (current_time - order.get('created_at', 0)) < 60
+            )
+            
+            if recent_count >= 5:
+                return self.record_suspicious_activity(user_id, "RAPID_ORDER_CREATION", 3)
+            
+            # Check for duplicate screenshot submissions
+            screenshots = [order.get('screenshot_hash') for order in recent_orders if order.get('screenshot_hash')]
+            if len(screenshots) != len(set(screenshots)) and len(screenshots) > 1:
+                return self.record_suspicious_activity(user_id, "DUPLICATE_SCREENSHOTS", 5)
         
-        return False
+        return False, ""
+    
+    def check_message_flood(self, user_id: int) -> tuple[bool, str]:
+        """Check for message flooding"""
+        return self.record_suspicious_activity(user_id, "MESSAGE_FLOOD", 3)
     
     def reset_user(self, user_id: int):
-        """Reset suspicion score for user"""
-        if user_id in self.suspicious_users:
-            del self.suspicious_users[user_id]
+        """Reset suspicion score and unblock user"""
+        with self._lock:
+            if user_id in self.suspicious_users:
+                del self.suspicious_users[user_id]
+            if user_id in self.blocked_users:
+                del self.blocked_users[user_id]
+    
+    def get_user_status(self, user_id: int) -> dict:
+        """Get user's current abuse status"""
+        with self._lock:
+            is_blocked = self.is_user_blocked(user_id)
+            user_data = self.suspicious_users.get(user_id, {})
+            
+            return {
+                'is_blocked': is_blocked,
+                'block_expires': self.blocked_users.get(user_id, 0),
+                'suspicion_score': user_data.get('score', 0),
+                'warnings': user_data.get('warnings', 0),
+                'recent_activities': user_data.get('activities', [])[-5:]
+            }
+    
+    def cleanup_old_data(self):
+        """Clean up old data to prevent memory bloat"""
+        with self._lock:
+            current_time = time.time()
+            
+            # Remove expired blocks
+            expired_blocks = [uid for uid, exp_time in self.blocked_users.items() if exp_time < current_time]
+            for uid in expired_blocks:
+                del self.blocked_users[uid]
+            
+            # Remove users with no recent activity (7 days)
+            inactive_users = []
+            for uid, data in self.suspicious_users.items():
+                if current_time - data.get('last_activity', 0) > 604800:  # 7 days
+                    inactive_users.append(uid)
+            
+            for uid in inactive_users:
+                del self.suspicious_users[uid]
 
 
 # Global abuse detector

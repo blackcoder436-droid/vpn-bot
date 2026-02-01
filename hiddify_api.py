@@ -15,7 +15,8 @@ class HiddifyApi:
         self.server = SERVERS[server_id]
         self.base_url = self.server['url'].rstrip('/')
         self.api_key = self.server.get('api_key', '')
-        self.proxy_path = self.server.get('proxy_path', '').strip('/')
+        self.proxy_path = self.server.get('proxy_path', '').strip('/')  # Admin path for API
+        self.user_sub_path = self.server.get('user_sub_path', self.proxy_path).strip('/')  # User subscription path
         self.admin_uuid = self.server.get('admin_uuid', '')
         
         self.session = requests.Session()
@@ -129,13 +130,25 @@ class HiddifyApi:
                 # Get the user UUID from response
                 user_uuid = result.get('uuid')
                 
-                # Generate subscription link
-                # Hiddify subscription format: https://domain/proxy_path/UUID/
-                # For user panel: /proxy_path/uuid/ (user can access configs here)
-                sub_link = f"{self.base_url}/{self.proxy_path}/{user_uuid}/"
+                # Generate subscription links - Hiddify format
+                # Use user_sub_path (not admin proxy_path) for subscription links
+                # Format: https://domain/user_sub_path/uuid/#fragment
                 
-                # Auto sub link format
-                auto_sub = f"{self.base_url}/{self.proxy_path}/{user_uuid}/auto/"
+                # Create URL-safe fragment: username-{devices}D-Key-{number}
+                # Example: blackc0der404-1D-Key-8
+                import re
+                fragment_name = f"{username}-{devices}D-Key-{key_number}" if username else f"User{telegram_id}-{devices}D-Key-{key_number}"
+                # Remove any characters that are not alphanumeric or hyphen
+                fragment_name = re.sub(r'[^a-zA-Z0-9\-_]', '', fragment_name)
+                
+                # Main subscription link with fragment (for Hiddify app)
+                # Format: https://domain/user_sub_path/uuid/#name
+                sub_link = f"{self.base_url}/{self.user_sub_path}/{user_uuid}/#{fragment_name}"
+                
+                # User page link (without fragment)
+                user_page = f"{self.base_url}/{self.user_sub_path}/{user_uuid}/"
+                
+                print(f"📎 Subscription link: {sub_link}")
                 
                 return {
                     'success': True,
@@ -143,8 +156,8 @@ class HiddifyApi:
                     'client_id': user_uuid,  # For compatibility with XUI
                     'user_name': user_name,
                     'user_uuid': user_uuid,
-                    'sub_link': sub_link,
-                    'config_link': auto_sub,  # Auto config link
+                    'sub_link': sub_link,  # Main subscription link with fragment
+                    'config_link': user_page,  # User page link
                     'sub_id': user_uuid,  # For compatibility
                     'expiry_date': datetime.now() + timedelta(days=expiry_days),
                     'data_limit': data_limit_gb,
@@ -159,6 +172,44 @@ class HiddifyApi:
             print(f"❌ Error creating user: {e}")
             import traceback
             traceback.print_exc()
+            return None
+    
+    def extend_user_expiry(self, user_uuid, days_to_add):
+        """Extend user's expiry by adding days
+        
+        Args:
+            user_uuid: The user's UUID
+            days_to_add: Number of days to add to current expiry
+            
+        Returns:
+            New expiry date or None if failed
+        """
+        try:
+            # First get current user info
+            user = self.get_user_by_uuid(user_uuid)
+            if not user:
+                print(f"❌ User {user_uuid} not found")
+                return None
+            
+            # Get current package_days and add more
+            current_days = user.get('package_days', 30)
+            new_days = current_days + days_to_add
+            
+            # Update user with new package_days
+            url = f"{self.base_url}/{self.proxy_path}/api/v2/admin/user/{user_uuid}/"
+            update_data = {'package_days': new_days}
+            
+            response = self.session.patch(url, json=update_data, timeout=30)
+            
+            if response.status_code == 200:
+                new_expiry = datetime.now() + timedelta(days=new_days)
+                print(f"✅ Extended user {user_uuid} by {days_to_add} days (new total: {new_days} days)")
+                return new_expiry
+            else:
+                print(f"❌ Failed to extend user: {response.status_code} - {response.text}")
+                return None
+        except Exception as e:
+            print(f"❌ Error extending user expiry: {e}")
             return None
     
     def update_user(self, user_uuid, **kwargs):
@@ -271,9 +322,27 @@ class HiddifyApi:
             return None
     
     def verify_user_exists(self, user_uuid):
-        """Verify if a user exists"""
+        """Verify if a user exists and return user info"""
         user = self.get_user_by_uuid(user_uuid)
-        return user is not None
+        if user:
+            # Return in same format as XUI for compatibility
+            # Convert Hiddify user to compatible format
+            return {
+                'client': {
+                    'email': user.get('name', user_uuid),
+                    'id': user.get('uuid', user_uuid),
+                    'expiryTime': user.get('package_days', 0) * 86400000 if user.get('package_days') else 0,  # Convert days to ms
+                    'totalGB': user.get('usage_limit_GB', 0),
+                    'up': user.get('current_usage_GB', 0) * 1024 * 1024 * 1024,  # Convert GB to bytes
+                    'down': 0
+                },
+                'inbound': {
+                    'protocol': 'hiddify',  # Mark as hiddify type
+                    'port': 443
+                },
+                'hiddify_user': user  # Keep original user data
+            }
+        return None
     
     def get_available_protocols(self):
         """Get list of available protocols (Hiddify supports multiple protocols)"""
@@ -311,10 +380,11 @@ def delete_vpn_user_hiddify(server_id, user_uuid):
 
 
 def verify_user_exists_hiddify(server_id, user_uuid):
-    """Verify if user exists in Hiddify panel"""
+    """Verify if user exists in Hiddify panel and return user info"""
     try:
         api = HiddifyApi(server_id)
-        return api.verify_user_exists(user_uuid)
+        result = api.verify_user_exists(user_uuid)
+        return result if result else False
     except Exception as e:
         print(f"❌ Error verifying Hiddify user: {e}")
         return False
