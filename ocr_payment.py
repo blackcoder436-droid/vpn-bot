@@ -10,22 +10,122 @@ import requests
 from io import BytesIO
 from PIL import Image
 import logging
+import threading
+import time
+from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
 # Initialize EasyOCR reader (English + Myanmar)
 # First run will download models (~100MB)
 reader = None
+reader_lock = threading.Lock()  # Thread lock for OCR operations
+
+# OCR Queue management
+ocr_queue_lock = threading.Lock()
+ocr_active_count = 0
+MAX_CONCURRENT_OCR = 2  # Maximum concurrent OCR operations
+OCR_TIMEOUT = 60  # Timeout for OCR operations in seconds
+
+# Rate limiting for OCR per user
+ocr_user_timestamps = defaultdict(list)
+OCR_RATE_LIMIT = 3  # Max OCR requests per user
+OCR_RATE_WINDOW = 300  # 5 minutes window
+
+# Image validation settings
+MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5MB max
+MIN_IMAGE_SIZE = 10 * 1024  # 10KB min (reject tiny/empty files)
+ALLOWED_FORMATS = {'JPEG', 'PNG', 'WEBP'}
+MAX_IMAGE_DIMENSION = 4096  # Max width/height
 
 def get_reader():
-    """Lazy load OCR reader to avoid slow startup"""
+    """Lazy load OCR reader to avoid slow startup - thread safe"""
     global reader
-    if reader is None:
-        logger.info("🔄 Loading OCR models (first time may take a while)...")
-        # Use English for numbers, add 'my' for Myanmar if needed
-        reader = easyocr.Reader(['en'], gpu=False, verbose=False)
-        logger.info("✅ OCR models loaded successfully")
+    with reader_lock:
+        if reader is None:
+            logger.info("🔄 Loading OCR models (first time may take a while)...")
+            # Use English for numbers, add 'my' for Myanmar if needed
+            reader = easyocr.Reader(['en'], gpu=False, verbose=False)
+            logger.info("✅ OCR models loaded successfully")
     return reader
+
+def check_ocr_rate_limit(user_id: int) -> bool:
+    """Check if user has exceeded OCR rate limit"""
+    current_time = time.time()
+    
+    # Clean old timestamps
+    ocr_user_timestamps[user_id] = [
+        ts for ts in ocr_user_timestamps[user_id] 
+        if current_time - ts < OCR_RATE_WINDOW
+    ]
+    
+    # Check limit
+    if len(ocr_user_timestamps[user_id]) >= OCR_RATE_LIMIT:
+        return False
+    
+    # Add new timestamp
+    ocr_user_timestamps[user_id].append(current_time)
+    return True
+
+def validate_image(image_data: BytesIO, file_size: int = None) -> dict:
+    """
+    Validate image for security
+    
+    Returns:
+        dict: {'valid': bool, 'error': str or None}
+    """
+    try:
+        # Check file size
+        if file_size:
+            if file_size > MAX_IMAGE_SIZE:
+                return {'valid': False, 'error': f'File too large (max {MAX_IMAGE_SIZE // 1024 // 1024}MB)'}
+            if file_size < MIN_IMAGE_SIZE:
+                return {'valid': False, 'error': 'File too small or empty'}
+        
+        # Reset stream position
+        image_data.seek(0)
+        
+        # Open and validate image
+        img = Image.open(image_data)
+        
+        # Check format
+        if img.format not in ALLOWED_FORMATS:
+            return {'valid': False, 'error': f'Invalid format. Allowed: {", ".join(ALLOWED_FORMATS)}'}
+        
+        # Check dimensions
+        width, height = img.size
+        if width > MAX_IMAGE_DIMENSION or height > MAX_IMAGE_DIMENSION:
+            return {'valid': False, 'error': f'Image too large (max {MAX_IMAGE_DIMENSION}x{MAX_IMAGE_DIMENSION})'}
+        
+        if width < 100 or height < 100:
+            return {'valid': False, 'error': 'Image too small'}
+        
+        # Verify image is actually readable (catches corrupted files)
+        img.verify()
+        
+        # Reset for further processing
+        image_data.seek(0)
+        
+        return {'valid': True, 'error': None}
+        
+    except Exception as e:
+        logger.warning(f"Image validation failed: {e}")
+        return {'valid': False, 'error': 'Invalid or corrupted image file'}
+
+def acquire_ocr_slot() -> bool:
+    """Try to acquire an OCR processing slot"""
+    global ocr_active_count
+    with ocr_queue_lock:
+        if ocr_active_count >= MAX_CONCURRENT_OCR:
+            return False
+        ocr_active_count += 1
+        return True
+
+def release_ocr_slot():
+    """Release an OCR processing slot"""
+    global ocr_active_count
+    with ocr_queue_lock:
+        ocr_active_count = max(0, ocr_active_count - 1)
 
 def download_telegram_image(bot, file_id):
     """Download image from Telegram"""
@@ -198,50 +298,81 @@ def verify_payment_amount(ocr_amount, expected_amount, tolerance=100):
         'reason': 'Amount matches' if match else f'Amount mismatch: detected {ocr_amount}, expected {expected_amount}'
     }
 
-def process_payment_screenshot(bot, file_id, expected_amount):
+def process_payment_screenshot(bot, file_id, expected_amount, user_id: int = None):
     """
-    Complete payment verification process
+    Complete payment verification process with security checks
     
     Args:
         bot: Telegram bot instance
         file_id: Telegram file ID of screenshot
         expected_amount: Expected payment amount
+        user_id: User ID for rate limiting
         
     Returns:
         dict: Complete verification result
     """
-    # Download image
-    image_data = download_telegram_image(bot, file_id)
-    if not image_data:
+    # Check user rate limit
+    if user_id and not check_ocr_rate_limit(user_id):
         return {
             'success': False,
             'verified': False,
-            'error': 'Failed to download screenshot'
+            'error': 'OCR rate limit exceeded. Please wait a few minutes.'
         }
     
-    # Extract amount using OCR
-    ocr_result = extract_amount_from_image(image_data)
-    
-    if not ocr_result['success']:
+    # Try to acquire OCR slot
+    if not acquire_ocr_slot():
         return {
             'success': False,
             'verified': False,
-            'error': ocr_result.get('error', 'OCR failed'),
-            'raw_text': ocr_result.get('raw_text', '')
+            'error': 'Server busy. Please try again in a moment.'
         }
     
-    # Verify amount
-    verification = verify_payment_amount(ocr_result['amount'], expected_amount)
-    
-    return {
-        'success': True,
-        'verified': verification['match'],
-        'ocr_amount': ocr_result['amount'],
-        'expected_amount': expected_amount,
-        'confidence': ocr_result['confidence'],
-        'raw_text': ocr_result['raw_text'][:500],  # Limit text length
-        'reason': verification['reason']
-    }
+    try:
+        # Download image
+        image_data = download_telegram_image(bot, file_id)
+        if not image_data:
+            return {
+                'success': False,
+                'verified': False,
+                'error': 'Failed to download screenshot'
+            }
+        
+        # Validate image for security
+        validation = validate_image(image_data)
+        if not validation['valid']:
+            return {
+                'success': False,
+                'verified': False,
+                'error': validation['error']
+            }
+        
+        # Extract amount using OCR
+        ocr_result = extract_amount_from_image(image_data)
+        
+        if not ocr_result['success']:
+            return {
+                'success': False,
+                'verified': False,
+                'error': ocr_result.get('error', 'OCR failed'),
+                'raw_text': ocr_result.get('raw_text', '')
+            }
+        
+        # Verify amount
+        verification = verify_payment_amount(ocr_result['amount'], expected_amount)
+        
+        return {
+            'success': True,
+            'verified': verification['match'],
+            'ocr_amount': ocr_result['amount'],
+            'expected_amount': expected_amount,
+            'confidence': ocr_result['confidence'],
+            'raw_text': ocr_result['raw_text'][:500],  # Limit text length
+            'reason': verification['reason']
+        }
+        
+    finally:
+        # Always release OCR slot
+        release_ocr_slot()
 
 
 # Test function

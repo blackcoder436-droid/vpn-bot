@@ -135,6 +135,67 @@ def init_db():
         cursor.execute('ALTER TABLE users ADD COLUMN referral_code TEXT')
     except:
         pass  # Column already exists
+    
+    # Feature flags table (persistent settings)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS feature_flags (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            flag_name TEXT UNIQUE NOT NULL,
+            is_enabled INTEGER DEFAULT 1,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_by INTEGER
+        )
+    ''')
+    
+    # Initialize default feature flags
+    default_flags = [
+        ('referral_system', 1),
+        ('free_test_key', 1),
+        ('protocol_change', 1),
+        ('auto_approve', 1)
+    ]
+    for flag_name, is_enabled in default_flags:
+        cursor.execute('''
+            INSERT OR IGNORE INTO feature_flags (flag_name, is_enabled) VALUES (?, ?)
+        ''', (flag_name, is_enabled))
+    
+    # User bans table (temporary ban support)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS user_bans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER NOT NULL,
+            reason TEXT,
+            banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            banned_until TIMESTAMP,
+            banned_by INTEGER,
+            is_active INTEGER DEFAULT 1,
+            unbanned_at TIMESTAMP,
+            unbanned_by INTEGER,
+            FOREIGN KEY (telegram_id) REFERENCES users(telegram_id)
+        )
+    ''')
+    
+    # Dynamic servers table (admin can add/remove servers)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS servers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            server_id TEXT UNIQUE NOT NULL,
+            name TEXT NOT NULL,
+            url TEXT NOT NULL,
+            panel_path TEXT NOT NULL,
+            domain TEXT NOT NULL,
+            panel_type TEXT NOT NULL DEFAULT 'xui',
+            sub_port INTEGER DEFAULT 2096,
+            api_key TEXT,
+            admin_uuid TEXT,
+            proxy_path TEXT,
+            user_sub_path TEXT,
+            is_active INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            created_by INTEGER,
+            updated_at TIMESTAMP
+        )
+    ''')
 
     conn.commit()
     conn.close()
@@ -781,6 +842,455 @@ def get_referred_users_details(referrer_id):
         })
     
     return referred_users
+
+# ==================== FEATURE FLAGS ====================
+
+def get_feature_flag(flag_name):
+    """Get feature flag status from database"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    cursor.execute('SELECT is_enabled FROM feature_flags WHERE flag_name = ?', (flag_name,))
+    result = cursor.fetchone()
+    conn.close()
+    return bool(result[0]) if result else True  # Default to True if not found
+
+def set_feature_flag(flag_name, is_enabled, updated_by=None):
+    """Set feature flag status in database"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    try:
+        cursor.execute('''
+            INSERT INTO feature_flags (flag_name, is_enabled, updated_at, updated_by)
+            VALUES (?, ?, CURRENT_TIMESTAMP, ?)
+            ON CONFLICT(flag_name) DO UPDATE SET 
+                is_enabled = excluded.is_enabled,
+                updated_at = CURRENT_TIMESTAMP,
+                updated_by = excluded.updated_by
+        ''', (flag_name, 1 if is_enabled else 0, updated_by))
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"Error setting feature flag: {e}")
+        return False
+    finally:
+        conn.close()
+
+def get_all_feature_flags():
+    """Get all feature flags from database"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    cursor.execute('SELECT flag_name, is_enabled FROM feature_flags')
+    results = cursor.fetchall()
+    conn.close()
+    return {row[0]: bool(row[1]) for row in results}
+
+# ==================== USER BAN SYSTEM ====================
+
+def ban_user(telegram_id, reason=None, duration_hours=None, banned_by=None):
+    """
+    Ban a user (temporary or permanent)
+    duration_hours: None = permanent, number = temporary ban in hours
+    """
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    
+    banned_until = None
+    if duration_hours:
+        banned_until = datetime.now() + timedelta(hours=duration_hours)
+    
+    try:
+        # Deactivate any existing active bans for this user
+        cursor.execute('''
+            UPDATE user_bans SET is_active = 0 WHERE telegram_id = ? AND is_active = 1
+        ''', (telegram_id,))
+        
+        # Create new ban
+        cursor.execute('''
+            INSERT INTO user_bans (telegram_id, reason, banned_until, banned_by)
+            VALUES (?, ?, ?, ?)
+        ''', (telegram_id, reason, banned_until, banned_by))
+        
+        # Also update users table
+        cursor.execute('UPDATE users SET is_banned = 1 WHERE telegram_id = ?', (telegram_id,))
+        
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"Error banning user: {e}")
+        return False
+    finally:
+        conn.close()
+
+def unban_user(telegram_id, unbanned_by=None):
+    """Unban a user"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    try:
+        cursor.execute('''
+            UPDATE user_bans 
+            SET is_active = 0, unbanned_at = CURRENT_TIMESTAMP, unbanned_by = ?
+            WHERE telegram_id = ? AND is_active = 1
+        ''', (unbanned_by, telegram_id))
+        
+        cursor.execute('UPDATE users SET is_banned = 0 WHERE telegram_id = ?', (telegram_id,))
+        
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"Error unbanning user: {e}")
+        return False
+    finally:
+        conn.close()
+
+def is_user_banned(telegram_id):
+    """
+    Check if user is currently banned
+    Returns: dict with ban info or None if not banned
+    """
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT reason, banned_at, banned_until, banned_by
+        FROM user_bans 
+        WHERE telegram_id = ? AND is_active = 1
+        ORDER BY banned_at DESC LIMIT 1
+    ''', (telegram_id,))
+    result = cursor.fetchone()
+    conn.close()
+    
+    if not result:
+        return None
+    
+    reason, banned_at, banned_until, banned_by = result
+    
+    # Check if temporary ban has expired
+    if banned_until:
+        if datetime.now() > datetime.fromisoformat(banned_until):
+            # Ban expired, auto-unban
+            unban_user(telegram_id)
+            return None
+    
+    return {
+        'reason': reason,
+        'banned_at': banned_at,
+        'banned_until': banned_until,
+        'banned_by': banned_by,
+        'is_permanent': banned_until is None
+    }
+
+def get_banned_users():
+    """Get list of all currently banned users"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT b.telegram_id, b.reason, b.banned_at, b.banned_until, b.banned_by,
+               u.username, u.first_name
+        FROM user_bans b
+        LEFT JOIN users u ON b.telegram_id = u.telegram_id
+        WHERE b.is_active = 1
+        ORDER BY b.banned_at DESC
+    ''')
+    results = cursor.fetchall()
+    conn.close()
+    
+    banned_users = []
+    for row in results:
+        # Check if temporary ban expired
+        if row[3]:  # banned_until exists
+            if datetime.now() > datetime.fromisoformat(row[3]):
+                unban_user(row[0])  # Auto-unban
+                continue
+        
+        banned_users.append({
+            'telegram_id': row[0],
+            'reason': row[1],
+            'banned_at': row[2],
+            'banned_until': row[3],
+            'banned_by': row[4],
+            'username': row[5],
+            'first_name': row[6],
+            'is_permanent': row[3] is None
+        })
+    
+    return banned_users
+
+def get_user_ban_history(telegram_id):
+    """Get ban history for a user"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT reason, banned_at, banned_until, banned_by, is_active, unbanned_at
+        FROM user_bans 
+        WHERE telegram_id = ?
+        ORDER BY banned_at DESC
+    ''', (telegram_id,))
+    results = cursor.fetchall()
+    conn.close()
+    
+    return [{
+        'reason': row[0],
+        'banned_at': row[1],
+        'banned_until': row[2],
+        'banned_by': row[3],
+        'is_active': bool(row[4]),
+        'unbanned_at': row[5]
+    } for row in results]
+
+# ==================== STATISTICS ====================
+
+def get_statistics(period='all'):
+    """
+    Get comprehensive statistics
+    period: 'today', 'week', 'month', 'all'
+    """
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    
+    # Date filter
+    date_filter = ""
+    if period == 'today':
+        date_filter = "AND date(created_at) = date('now')"
+    elif period == 'week':
+        date_filter = "AND created_at >= datetime('now', '-7 days')"
+    elif period == 'month':
+        date_filter = "AND created_at >= datetime('now', '-30 days')"
+    
+    stats = {}
+    
+    # Total users
+    cursor.execute(f"SELECT COUNT(*) FROM users WHERE 1=1 {date_filter.replace('created_at', 'created_at')}")
+    stats['total_users'] = cursor.fetchone()[0]
+    
+    # Total orders
+    cursor.execute(f"SELECT COUNT(*) FROM orders WHERE 1=1 {date_filter}")
+    stats['total_orders'] = cursor.fetchone()[0]
+    
+    # Completed orders
+    cursor.execute(f"SELECT COUNT(*) FROM orders WHERE status = 'approved' {date_filter}")
+    stats['completed_orders'] = cursor.fetchone()[0]
+    
+    # Pending orders
+    cursor.execute(f"SELECT COUNT(*) FROM orders WHERE status = 'pending' {date_filter}")
+    stats['pending_orders'] = cursor.fetchone()[0]
+    
+    # Rejected orders
+    cursor.execute(f"SELECT COUNT(*) FROM orders WHERE status = 'rejected' {date_filter}")
+    stats['rejected_orders'] = cursor.fetchone()[0]
+    
+    # Total revenue (from approved orders)
+    cursor.execute(f"SELECT COALESCE(SUM(amount), 0) FROM orders WHERE status = 'approved' {date_filter}")
+    stats['total_revenue'] = cursor.fetchone()[0]
+    
+    # Active VPN keys
+    cursor.execute("SELECT COUNT(*) FROM vpn_keys WHERE is_active = 1")
+    stats['active_keys'] = cursor.fetchone()[0]
+    
+    # Free tests used
+    cursor.execute(f"SELECT COUNT(*) FROM free_tests WHERE 1=1 {date_filter.replace('created_at', 'used_at')}")
+    stats['free_tests_used'] = cursor.fetchone()[0]
+    
+    # Referrals count
+    cursor.execute(f"SELECT COUNT(*) FROM referrals WHERE 1=1 {date_filter.replace('created_at', 'referred_at')}")
+    stats['total_referrals'] = cursor.fetchone()[0]
+    
+    # Paid referrals
+    cursor.execute(f"SELECT COUNT(*) FROM referrals WHERE is_paid = 1 {date_filter.replace('created_at', 'referred_at')}")
+    stats['paid_referrals'] = cursor.fetchone()[0]
+    
+    # Banned users count
+    cursor.execute("SELECT COUNT(*) FROM user_bans WHERE is_active = 1")
+    stats['banned_users'] = cursor.fetchone()[0]
+    
+    conn.close()
+    return stats
+
+def get_revenue_by_period():
+    """Get revenue breakdown by day for last 7 days"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT date(approved_at) as day, SUM(amount) as revenue, COUNT(*) as orders
+        FROM orders 
+        WHERE status = 'approved' AND approved_at >= datetime('now', '-7 days')
+        GROUP BY date(approved_at)
+        ORDER BY day DESC
+    ''')
+    results = cursor.fetchall()
+    conn.close()
+    
+    return [{'date': row[0], 'revenue': row[1], 'orders': row[2]} for row in results]
+
+def get_top_users(limit=10):
+    """Get top users by order amount"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT u.telegram_id, u.username, u.first_name, 
+               COUNT(o.id) as order_count, 
+               COALESCE(SUM(o.amount), 0) as total_spent
+        FROM users u
+        LEFT JOIN orders o ON u.telegram_id = o.telegram_id AND o.status = 'approved'
+        GROUP BY u.telegram_id
+        HAVING total_spent > 0
+        ORDER BY total_spent DESC
+        LIMIT ?
+    ''', (limit,))
+    results = cursor.fetchall()
+    conn.close()
+    
+    return [{
+        'telegram_id': row[0],
+        'username': row[1],
+        'first_name': row[2],
+        'order_count': row[3],
+        'total_spent': row[4]
+    } for row in results]
+
+# ==================== SERVER MANAGEMENT ====================
+
+def add_server(server_id, name, url, panel_path, domain, panel_type='xui', 
+               sub_port=2096, api_key=None, admin_uuid=None, proxy_path=None, 
+               user_sub_path=None, created_by=None):
+    """Add a new server to database"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    try:
+        cursor.execute('''
+            INSERT INTO servers (server_id, name, url, panel_path, domain, panel_type,
+                               sub_port, api_key, admin_uuid, proxy_path, user_sub_path, created_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (server_id, name, url, panel_path, domain, panel_type, 
+              sub_port, api_key, admin_uuid, proxy_path, user_sub_path, created_by))
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False  # Server ID already exists
+    except Exception as e:
+        print(f"Error adding server: {e}")
+        return False
+    finally:
+        conn.close()
+
+def update_server(server_id, **kwargs):
+    """Update server settings"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    
+    # Build update query dynamically
+    valid_fields = ['name', 'url', 'panel_path', 'domain', 'panel_type', 
+                    'sub_port', 'api_key', 'admin_uuid', 'proxy_path', 
+                    'user_sub_path', 'is_active']
+    
+    updates = []
+    values = []
+    for field, value in kwargs.items():
+        if field in valid_fields:
+            updates.append(f"{field} = ?")
+            values.append(value)
+    
+    if not updates:
+        return False
+    
+    updates.append("updated_at = CURRENT_TIMESTAMP")
+    values.append(server_id)
+    
+    try:
+        cursor.execute(f'''
+            UPDATE servers SET {', '.join(updates)} WHERE server_id = ?
+        ''', values)
+        conn.commit()
+        return cursor.rowcount > 0
+    except Exception as e:
+        print(f"Error updating server: {e}")
+        return False
+    finally:
+        conn.close()
+
+def delete_server(server_id):
+    """Delete a server from database"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    try:
+        cursor.execute('DELETE FROM servers WHERE server_id = ?', (server_id,))
+        conn.commit()
+        return cursor.rowcount > 0
+    except Exception as e:
+        print(f"Error deleting server: {e}")
+        return False
+    finally:
+        conn.close()
+
+def get_server(server_id):
+    """Get a specific server by ID"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM servers WHERE server_id = ?', (server_id,))
+    row = cursor.fetchone()
+    conn.close()
+    
+    if not row:
+        return None
+    
+    return {
+        'id': row[0],
+        'server_id': row[1],
+        'name': row[2],
+        'url': row[3],
+        'panel_path': row[4],
+        'domain': row[5],
+        'panel_type': row[6],
+        'sub_port': row[7],
+        'api_key': row[8],
+        'admin_uuid': row[9],
+        'proxy_path': row[10],
+        'user_sub_path': row[11],
+        'is_active': bool(row[12]),
+        'created_at': row[13],
+        'created_by': row[14],
+        'updated_at': row[15]
+    }
+
+def get_all_db_servers(active_only=True):
+    """Get all servers from database"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    
+    if active_only:
+        cursor.execute('SELECT * FROM servers WHERE is_active = 1 ORDER BY created_at')
+    else:
+        cursor.execute('SELECT * FROM servers ORDER BY created_at')
+    
+    rows = cursor.fetchall()
+    conn.close()
+    
+    servers = {}
+    for row in rows:
+        server_id = row[1]
+        server_data = {
+            'name': row[2],
+            'url': row[3],
+            'panel_path': row[4],
+            'domain': row[5],
+            'panel_type': row[6],
+            'sub_port': row[7],
+            'is_active': bool(row[12]),
+            'from_database': True
+        }
+        
+        # Add Hiddify-specific fields if present
+        if row[6] == 'hiddify':
+            server_data['api_key'] = row[8]
+            server_data['admin_uuid'] = row[9]
+            server_data['proxy_path'] = row[10]
+            server_data['user_sub_path'] = row[11]
+        
+        servers[server_id] = server_data
+    
+    return servers
+
+def toggle_server_active(server_id, is_active):
+    """Toggle server active status"""
+    return update_server(server_id, is_active=1 if is_active else 0)
 
 if __name__ == "__main__":
     init_db()

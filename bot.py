@@ -4,18 +4,30 @@ import logging
 import re
 import json
 import threading
+import shutil
+import os
 from datetime import datetime, timedelta
-from config import BOT_TOKEN, ADMIN_CHAT_ID, PAYMENT_CHANNEL_ID, SERVERS, PLANS, PAYMENT_INFO, MESSAGES
+import pytz  # For timezone support
+from config import BOT_TOKEN, ADMIN_CHAT_ID, PAYMENT_CHANNEL_ID, SERVERS as CONFIG_SERVERS, PLANS, PAYMENT_INFO, MESSAGES, DATABASE_PATH
 from database import (
     init_db, create_user, get_user, has_used_free_test, mark_free_test_used,
     create_order, update_order_screenshot, approve_order, reject_order,
     get_order, get_user_orders, save_vpn_key, get_user_keys, get_vpn_key_by_id, update_vpn_key,
     get_sales_stats, get_all_orders, get_expiring_keys, get_all_users,
-    deactivate_vpn_key, ban_user, unban_user, is_user_banned_db, log_security_event,
+    deactivate_vpn_key, log_security_event,
     # Referral system
     get_referral_code, get_user_by_referral_code, add_referral, 
     mark_referral_paid, get_referral_stats, claim_free_month_reward, get_referrer_id,
-    get_user_active_keys, extend_key_expiry, get_referred_users_details
+    get_user_active_keys, extend_key_expiry, get_referred_users_details,
+    # Feature flags
+    get_feature_flag, set_feature_flag, get_all_feature_flags,
+    # User ban system
+    ban_user, unban_user, is_user_banned as is_user_banned_db, 
+    get_banned_users, get_user_ban_history,
+    # Statistics
+    get_statistics, get_revenue_by_period, get_top_users,
+    # Server management
+    add_server, update_server, delete_server, get_server, get_all_db_servers, toggle_server_active
 )
 from xui_api import create_vpn_key, get_available_protocols, delete_vpn_client, verify_client_exists
 from security import (
@@ -62,8 +74,71 @@ user_sessions = {}
 # Server status (runtime - disabled servers)
 disabled_servers = set()
 
-# Banned users set
+# Banned users set (runtime cache)
 banned_users = set()
+
+# Dynamic SERVERS dict (merged from config + database)
+SERVERS = {}
+
+def load_servers():
+    """Load servers from config.py and merge with database servers"""
+    global SERVERS
+    
+    # Start with config servers
+    SERVERS = dict(CONFIG_SERVERS)
+    
+    # Merge database servers (database servers can override config)
+    try:
+        db_servers = get_all_db_servers(active_only=False)
+        for server_id, server_data in db_servers.items():
+            if server_id not in SERVERS:
+                # New server from database
+                SERVERS[server_id] = server_data
+            else:
+                # Update existing with database settings if needed
+                SERVERS[server_id]['from_database'] = True
+                
+        logger.info(f"📡 Servers loaded: {len(CONFIG_SERVERS)} from config + {len(db_servers)} from database = {len(SERVERS)} total")
+    except Exception as e:
+        logger.error(f"Error loading database servers: {e}")
+        # Keep using config servers only
+
+def get_active_servers():
+    """Get all active servers (not disabled)"""
+    return {
+        sid: sdata for sid, sdata in SERVERS.items() 
+        if sid not in disabled_servers and sdata.get('is_active', True) != False
+    }
+
+# Feature flags - Load from database on startup
+def load_feature_flags():
+    """Load feature flags from database"""
+    global feature_flags
+    try:
+        feature_flags = get_all_feature_flags()
+        # Ensure all expected flags exist
+        expected_flags = ['referral_system', 'free_test_key', 'protocol_change', 'auto_approve']
+        for flag in expected_flags:
+            if flag not in feature_flags:
+                feature_flags[flag] = True
+        logger.info(f"📋 Feature flags loaded: {feature_flags}")
+    except Exception as e:
+        logger.error(f"Error loading feature flags: {e}")
+        # Use defaults if database fails
+        feature_flags = {
+            'referral_system': True,
+            'free_test_key': True,
+            'protocol_change': True,
+            'auto_approve': True,
+        }
+
+# Initial feature flags (will be loaded from DB)
+feature_flags = {
+    'referral_system': True,
+    'free_test_key': True,
+    'protocol_change': True,
+    'auto_approve': True,
+}
 
 # ===================== SECURITY HELPERS =====================
 
@@ -248,10 +323,14 @@ def admin_menu_keyboard():
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(
         types.InlineKeyboardButton("📊 Sales Report", callback_data="admin_sales"),
+        types.InlineKeyboardButton("� Statistics", callback_data="admin_stats"),
         types.InlineKeyboardButton("📋 Pending Orders", callback_data="admin_pending"),
         types.InlineKeyboardButton("👥 All Users", callback_data="admin_users"),
+        types.InlineKeyboardButton("🚫 Ban Management", callback_data="admin_bans"),
         types.InlineKeyboardButton("🔔 Send Broadcast", callback_data="admin_broadcast"),
-        types.InlineKeyboardButton("🖥️ Server Management", callback_data="admin_servers")
+        types.InlineKeyboardButton("🖥️ Server Management", callback_data="admin_servers"),
+        types.InlineKeyboardButton("⚙️ Feature Management", callback_data="admin_features"),
+        types.InlineKeyboardButton("📦 Manual Backup", callback_data="admin_backup")
     )
     return markup
 
@@ -260,10 +339,90 @@ def server_management_keyboard():
     markup = types.InlineKeyboardMarkup(row_width=1)
     for server_id, server in SERVERS.items():
         status = "🔴 Disabled" if server_id in disabled_servers else "🟢 Active"
+        db_tag = " 📦" if server.get('from_database') else ""
         markup.add(types.InlineKeyboardButton(
-            f"{server['name']} - {status}",
+            f"{server['name']} - {status}{db_tag}",
             callback_data=f"toggle_server_{server_id}"
         ))
+    markup.add(
+        types.InlineKeyboardButton("➕ Add New Server", callback_data="add_server_start"),
+        types.InlineKeyboardButton("🗑️ Delete Server", callback_data="delete_server_start")
+    )
+    markup.add(types.InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_back"))
+    return markup
+
+def add_server_type_keyboard():
+    """Server type selection keyboard"""
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("🖥️ 3X-UI Panel", callback_data="add_server_xui"),
+        types.InlineKeyboardButton("🌐 Hiddify Panel", callback_data="add_server_hiddify")
+    )
+    markup.add(types.InlineKeyboardButton("❌ Cancel", callback_data="admin_servers"))
+    return markup
+
+def delete_server_keyboard():
+    """Delete server selection keyboard (only database servers)"""
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    db_servers = get_all_db_servers(active_only=False)
+    
+    if not db_servers:
+        markup.add(types.InlineKeyboardButton("📭 No custom servers to delete", callback_data="admin_servers"))
+    else:
+        for server_id, server in db_servers.items():
+            markup.add(types.InlineKeyboardButton(
+                f"🗑️ {server['name']} ({server_id})",
+                callback_data=f"confirm_delete_server_{server_id}"
+            ))
+    
+    markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="admin_servers"))
+    return markup
+
+def feature_management_keyboard():
+    """Feature management keyboard for admin"""
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    
+    features = [
+        ('referral_system', '👥 Referral System'),
+        ('free_test_key', '🎁 Free Test Key'),
+        ('protocol_change', '🔄 Protocol Change'),
+        ('auto_approve', '🤖 Auto-Approve (OCR)'),
+    ]
+    
+    for feature_id, feature_name in features:
+        status = "🟢 ON" if feature_flags.get(feature_id, True) else "🔴 OFF"
+        markup.add(types.InlineKeyboardButton(
+            f"{feature_name} - {status}",
+            callback_data=f"toggle_feature_{feature_id}"
+        ))
+    
+    markup.add(types.InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_back"))
+    return markup
+
+def stats_period_keyboard():
+    """Statistics period selection keyboard"""
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("📅 Today", callback_data="stats_today"),
+        types.InlineKeyboardButton("📆 This Week", callback_data="stats_week"),
+        types.InlineKeyboardButton("🗓️ This Month", callback_data="stats_month"),
+        types.InlineKeyboardButton("📊 All Time", callback_data="stats_all")
+    )
+    markup.add(
+        types.InlineKeyboardButton("🏆 Top Users", callback_data="stats_top_users"),
+        types.InlineKeyboardButton("💰 Revenue Chart", callback_data="stats_revenue")
+    )
+    markup.add(types.InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_back"))
+    return markup
+
+def ban_management_keyboard():
+    """Ban management keyboard for admin"""
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton("🚫 Ban User", callback_data="ban_user_start"),
+        types.InlineKeyboardButton("✅ Unban User", callback_data="unban_user_start"),
+        types.InlineKeyboardButton("📋 Banned Users List", callback_data="ban_list")
+    )
     markup.add(types.InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_back"))
     return markup
 
@@ -450,6 +609,22 @@ def broadcast_command(message):
     
     bot.reply_to(message, f"✅ Broadcast sent to {sent}/{len(users)} users")
 
+@bot.message_handler(commands=['backup'])
+def backup_command(message):
+    """Manual backup command for admin"""
+    user_id = message.from_user.id
+    
+    if user_id != ADMIN_CHAT_ID:
+        SecurityLogger.log_failed_auth(user_id, "backup_command")
+        return
+    
+    bot.reply_to(message, "⏳ Creating backup...")
+    
+    if manual_backup():
+        bot.reply_to(message, "✅ Backup created and sent to Payment Channel!")
+    else:
+        bot.reply_to(message, "❌ Backup failed! Check logs for details.")
+
 @bot.callback_query_handler(func=lambda call: True)
 def button_callback(call):
     """Handle button callbacks"""
@@ -495,6 +670,16 @@ def button_callback(call):
     
     # Free test key
     elif data == "free_test":
+        # Check if feature is enabled
+        if not feature_flags.get('free_test_key', True):
+            bot.edit_message_text(
+                "🚫 *Free Test Key ယယက္ခံ ပိတ်ထားပါသည်။*\n\nကျေးဇူးပြု၍ VPN Key ဝယ်ယူပါ။",
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=main_menu_keyboard()
+            )
+            return
+        
         if has_used_free_test(user_id):
             bot.edit_message_text(
                 MESSAGES['free_key_limit'],
@@ -1009,6 +1194,16 @@ def button_callback(call):
     
     # Exchange key - show user's keys to select
     elif data == "exchange_key":
+        # Check if feature is enabled
+        if not feature_flags.get('protocol_change', True):
+            bot.edit_message_text(
+                "🚫 *Protocol Change ယယက္ခံ ပိတ်ထားပါသည်။*\n\nနောက်မှ ပြန်ဖွင့်ပါမည်။",
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=main_menu_keyboard()
+            )
+            return
+        
         keys = get_user_keys(user_id)
         if not keys:
             bot.edit_message_text(
@@ -1263,6 +1458,15 @@ _Key အသစ်ကို App မှာ ပြန်ထည့်ပါ။_
     
     # Referral System
     elif data == "referral":
+        # Check if feature is enabled
+        if not feature_flags.get('referral_system', True):
+            bot.edit_message_text(
+                "🚫 *Referral System ယယက္ခံ ပိတ်ထားပါသည်။*\n\nနောက်မှ ပြန်ဖွင့်ပါမည်။",
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=main_menu_keyboard()
+            )
+            return
         show_referral_menu(call)
     
     elif data == "my_referral_link":
@@ -1737,11 +1941,17 @@ _App မှာ Subscription Link ထည့်ပြီး အသုံးပြ�
         if user_id != ADMIN_CHAT_ID:
             return
         
+        db_server_count = len(get_all_db_servers(active_only=False))
         text = "🖥️ *Server Management*\n\n"
-        text += "Server ကို နှိပ်ပြီး Enable/Disable လုပ်နိုင်ပါတယ်။\n\n"
+        text += "Server ကို နှိပ်ပြီး Enable/Disable လုပ်နိုင်ပါတယ်။\n"
+        text += f"📦 = Database မှ ထည့်ထားသော Server\n\n"
+        text += f"📊 Total: {len(SERVERS)} servers ({db_server_count} custom)\n\n"
+        
         for server_id, server in SERVERS.items():
-            status = "🔴 Disabled" if server_id in disabled_servers else "🟢 Active"
-            text += f"• {server['name']} - {status}\n"
+            status = "🔴" if server_id in disabled_servers else "🟢"
+            db_tag = " 📦" if server.get('from_database') else ""
+            panel_type = server.get('panel_type', 'xui').upper()
+            text += f"{status} {server['name']} [{panel_type}]{db_tag}\n"
         
         bot.edit_message_text(
             text,
@@ -1767,11 +1977,168 @@ _App မှာ Subscription Link ထည့်ပြီး အသုံးပြ�
         bot.answer_callback_query(call.id, f"{action}: {server_name}", show_alert=True)
         
         # Refresh server management page
+        db_server_count = len(get_all_db_servers(active_only=False))
         text = "🖥️ *Server Management*\n\n"
-        text += "Server ကို နှိပ်ပြီး Enable/Disable လုပ်နိုင်ပါတယ်။\n\n"
+        text += "Server ကို နှိပ်ပြီး Enable/Disable လုပ်နိုင်ပါတယ်။\n"
+        text += f"📦 = Database မှ ထည့်ထားသော Server\n\n"
+        text += f"📊 Total: {len(SERVERS)} servers ({db_server_count} custom)\n\n"
+        
         for sid, server in SERVERS.items():
-            status = "🔴 Disabled" if sid in disabled_servers else "🟢 Active"
-            text += f"• {server['name']} - {status}\n"
+            status = "🔴" if sid in disabled_servers else "🟢"
+            db_tag = " 📦" if server.get('from_database') else ""
+            panel_type = server.get('panel_type', 'xui').upper()
+            text += f"{status} {server['name']} [{panel_type}]{db_tag}\n"
+        
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=server_management_keyboard()
+        )
+    
+    # ==================== ADD SERVER ====================
+    elif data == "add_server_start":
+        if user_id != ADMIN_CHAT_ID:
+            return
+        
+        text = "➕ *Add New Server*\n\n"
+        text += "Panel Type ရွေးချယ်ပါ:"
+        
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=add_server_type_keyboard()
+        )
+    
+    elif data == "add_server_xui":
+        if user_id != ADMIN_CHAT_ID:
+            return
+        
+        user_sessions[user_id] = {'action': 'add_server', 'panel_type': 'xui', 'step': 1}
+        
+        text = "🖥️ *Add 3X-UI Server*\n\n"
+        text += "အောက်ပါ Format အတိုင်း Server Info ထည့်ပါ:\n\n"
+        text += "```\n"
+        text += "Server ID: sg4\n"
+        text += "Name: 🇸🇬 Singapore 4\n"
+        text += "URL: https://sg4.example.com:8080\n"
+        text += "Panel Path: /mka\n"
+        text += "Domain: sg4.example.com\n"
+        text += "Sub Port: 2096\n"
+        text += "```\n\n"
+        text += "💡 Format:\n`server_id,name,url,panel_path,domain,sub_port`\n\n"
+        text += "Example:\n`sg4,🇸🇬 Singapore 4,https://sg4.example.com:8080,/mka,sg4.example.com,2096`"
+        
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("❌ Cancel", callback_data="admin_servers"))
+        
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=markup
+        )
+    
+    elif data == "add_server_hiddify":
+        if user_id != ADMIN_CHAT_ID:
+            return
+        
+        user_sessions[user_id] = {'action': 'add_server', 'panel_type': 'hiddify', 'step': 1}
+        
+        text = "🌐 *Add Hiddify Server*\n\n"
+        text += "အောက်ပါ Format အတိုင်း Server Info ထည့်ပါ:\n\n"
+        text += "```\n"
+        text += "Server ID: hiddify2\n"
+        text += "Name: 🌐 Hiddify Server 2\n"
+        text += "URL: https://hiddify2.example.com\n"
+        text += "Admin Path: AdminUUID123\n"
+        text += "Domain: hiddify2.example.com\n"
+        text += "API Key: your-api-key\n"
+        text += "User Sub Path: UserSubPath\n"
+        text += "```\n\n"
+        text += "💡 Format:\n`server_id,name,url,admin_path,domain,api_key,user_sub_path`\n\n"
+        text += "Example:\n`hiddify2,🌐 Hiddify 2,https://h2.example.com,AdminPath,h2.example.com,api-key-here,UserSubPath`"
+        
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("❌ Cancel", callback_data="admin_servers"))
+        
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=markup
+        )
+    
+    # ==================== DELETE SERVER ====================
+    elif data == "delete_server_start":
+        if user_id != ADMIN_CHAT_ID:
+            return
+        
+        text = "🗑️ *Delete Server*\n\n"
+        text += "⚠️ Config.py မှ Server များကို ဖျက်၍မရပါ။\n"
+        text += "Database မှ ထည့်ထားသော Server များသာ ဖျက်နိုင်ပါသည်။\n\n"
+        text += "ဖျက်မည့် Server ကို ရွေးပါ:"
+        
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=delete_server_keyboard()
+        )
+    
+    elif data.startswith("confirm_delete_server_"):
+        if user_id != ADMIN_CHAT_ID:
+            return
+        
+        server_id = data.replace("confirm_delete_server_", "")
+        server = get_server(server_id)
+        
+        if not server:
+            bot.answer_callback_query(call.id, "❌ Server not found!", show_alert=True)
+            return
+        
+        text = f"⚠️ *Confirm Delete*\n\n"
+        text += f"Server: {server['name']}\n"
+        text += f"ID: `{server_id}`\n"
+        text += f"Type: {server['panel_type'].upper()}\n\n"
+        text += "ဒီ Server ကို ဖျက်မှာ သေချာပါသလား?"
+        
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            types.InlineKeyboardButton("✅ Yes, Delete", callback_data=f"do_delete_server_{server_id}"),
+            types.InlineKeyboardButton("❌ Cancel", callback_data="delete_server_start")
+        )
+        
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=markup
+        )
+    
+    elif data.startswith("do_delete_server_"):
+        if user_id != ADMIN_CHAT_ID:
+            return
+        
+        server_id = data.replace("do_delete_server_", "")
+        
+        if delete_server(server_id):
+            # Reload servers
+            load_servers()
+            bot.answer_callback_query(call.id, f"✅ Server {server_id} deleted!", show_alert=True)
+        else:
+            bot.answer_callback_query(call.id, "❌ Delete failed!", show_alert=True)
+        
+        # Go back to server management
+        db_server_count = len(get_all_db_servers(active_only=False))
+        text = "🖥️ *Server Management*\n\n"
+        text += f"📊 Total: {len(SERVERS)} servers ({db_server_count} custom)\n\n"
+        
+        for sid, server in SERVERS.items():
+            status = "🔴" if sid in disabled_servers else "🟢"
+            db_tag = " 📦" if server.get('from_database') else ""
+            text += f"{status} {server['name']}{db_tag}\n"
         
         bot.edit_message_text(
             text,
@@ -1789,6 +2156,317 @@ _App မှာ Subscription Link ထည့်ပြီး အသုံးပြ�
             call.message.chat.id,
             call.message.message_id,
             reply_markup=admin_menu_keyboard()
+        )
+    
+    # Manual Backup
+    elif data == "admin_backup":
+        if user_id != ADMIN_CHAT_ID:
+            return
+        
+        bot.answer_callback_query(call.id, "⏳ Creating backup...", show_alert=False)
+        
+        # Run backup in separate thread to not block
+        def do_backup():
+            if manual_backup():
+                bot.send_message(
+                    ADMIN_CHAT_ID,
+                    "✅ Backup created and sent to Payment Channel!"
+                )
+            else:
+                bot.send_message(
+                    ADMIN_CHAT_ID,
+                    "❌ Backup failed! Check logs."
+                )
+        
+        threading.Thread(target=do_backup, daemon=True).start()
+    
+    # Feature Management
+    elif data == "admin_features":
+        if user_id != ADMIN_CHAT_ID:
+            return
+        
+        text = "⚙️ *Feature Management*\n\n"
+        text += "Feature ကို နှိပ်ပြီး Enable/Disable လုပ်နိုင်ပါတယ်။\n\n"
+        
+        feature_names = {
+            'referral_system': '👥 Referral System',
+            'free_test_key': '🎁 Free Test Key',
+            'protocol_change': '🔄 Protocol Change',
+            'auto_approve': '🤖 Auto-Approve (OCR)',
+        }
+        
+        for feature_id, feature_name in feature_names.items():
+            status = "🟢 ON" if feature_flags.get(feature_id, True) else "🔴 OFF"
+            text += f"• {feature_name} - {status}\n"
+        
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=feature_management_keyboard()
+        )
+    
+    elif data.startswith("toggle_feature_"):
+        if user_id != ADMIN_CHAT_ID:
+            return
+        
+        feature_id = data.replace("toggle_feature_", "")
+        
+        # Toggle feature
+        if feature_id in feature_flags:
+            new_value = not feature_flags[feature_id]
+            feature_flags[feature_id] = new_value
+            # Save to database
+            set_feature_flag(feature_id, new_value, updated_by=user_id)
+            action = "✅ Enabled" if new_value else "🔴 Disabled"
+        else:
+            bot.answer_callback_query(call.id, "❌ Unknown feature", show_alert=True)
+            return
+        
+        feature_names = {
+            'referral_system': 'Referral System',
+            'free_test_key': 'Free Test Key',
+            'protocol_change': 'Protocol Change',
+            'auto_approve': 'Auto-Approve',
+        }
+        
+        feature_name = feature_names.get(feature_id, feature_id)
+        bot.answer_callback_query(call.id, f"{action}: {feature_name}", show_alert=True)
+        
+        # Refresh feature management page
+        text = "⚙️ *Feature Management*\n\n"
+        text += "Feature ကို နှိပ်ပြီး Enable/Disable လုပ်နိုင်ပါတယ်။\n\n"
+        
+        for fid, fname in feature_names.items():
+            status = "🟢 ON" if feature_flags.get(fid, True) else "🔴 OFF"
+            text += f"• {fname} - {status}\n"
+        
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=feature_management_keyboard()
+        )
+    
+    # ==================== STATISTICS ====================
+    elif data == "admin_stats":
+        if user_id != ADMIN_CHAT_ID:
+            return
+        
+        bot.edit_message_text(
+            "📈 *Statistics Dashboard*\n\n"
+            "အချိန်ကာလ ရွေးချယ်ပါ:",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=stats_period_keyboard()
+        )
+    
+    elif data.startswith("stats_"):
+        if user_id != ADMIN_CHAT_ID:
+            return
+        
+        period = data.replace("stats_", "")
+        
+        if period == "top_users":
+            top_users = get_top_users(10)
+            text = "🏆 *Top 10 Users (By Spending)*\n\n"
+            
+            if not top_users:
+                text += "User မရှိသေးပါ။"
+            else:
+                for i, user in enumerate(top_users, 1):
+                    name = user['username'] or user['first_name'] or f"User {user['telegram_id']}"
+                    text += f"{i}. {name}\n"
+                    text += f"   💰 {user['total_spent']:,} Ks | 🛒 {user['order_count']} orders\n\n"
+            
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="admin_stats"))
+            
+            bot.edit_message_text(
+                text,
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=markup
+            )
+            return
+        
+        elif period == "revenue":
+            revenue_data = get_revenue_by_period()
+            text = "💰 *Revenue (Last 7 Days)*\n\n"
+            
+            if not revenue_data:
+                text += "Data မရှိသေးပါ။"
+            else:
+                total = 0
+                for day in revenue_data:
+                    text += f"📅 {day['date']}: {day['revenue']:,} Ks ({day['orders']} orders)\n"
+                    total += day['revenue']
+                text += f"\n📊 Total: {total:,} Ks"
+            
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="admin_stats"))
+            
+            bot.edit_message_text(
+                text,
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=markup
+            )
+            return
+        
+        # Period-based stats
+        period_names = {
+            'today': 'Today',
+            'week': 'This Week',
+            'month': 'This Month',
+            'all': 'All Time'
+        }
+        
+        stats = get_statistics(period)
+        period_name = period_names.get(period, 'All Time')
+        
+        text = f"📊 *Statistics - {period_name}*\n\n"
+        text += f"👥 Users: {stats['total_users']:,}\n"
+        text += f"🛒 Total Orders: {stats['total_orders']:,}\n"
+        text += f"✅ Completed: {stats['completed_orders']:,}\n"
+        text += f"⏳ Pending: {stats['pending_orders']:,}\n"
+        text += f"❌ Rejected: {stats['rejected_orders']:,}\n"
+        text += f"💰 Revenue: {stats['total_revenue']:,} Ks\n\n"
+        text += f"🔑 Active Keys: {stats['active_keys']:,}\n"
+        text += f"🎁 Free Tests: {stats['free_tests_used']:,}\n"
+        text += f"👥 Referrals: {stats['total_referrals']:,}\n"
+        text += f"🚫 Banned Users: {stats['banned_users']:,}\n"
+        
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=stats_period_keyboard()
+        )
+    
+    # ==================== BAN MANAGEMENT ====================
+    elif data == "admin_bans":
+        if user_id != ADMIN_CHAT_ID:
+            return
+        
+        banned = get_banned_users()
+        text = "🚫 *Ban Management*\n\n"
+        text += f"Currently banned: {len(banned)} users\n\n"
+        text += "အောက်ပါ options ကို ရွေးချယ်ပါ:"
+        
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=ban_management_keyboard()
+        )
+    
+    elif data == "ban_user_start":
+        if user_id != ADMIN_CHAT_ID:
+            return
+        
+        user_sessions[user_id] = {'action': 'ban_user'}
+        
+        text = "🚫 *Ban User*\n\n"
+        text += "Ban လုပ်မည့် User ၏ Telegram ID ထည့်ပါ:\n\n"
+        text += "Format: `USER_ID HOURS REASON`\n"
+        text += "Example: `123456789 24 Spam messages`\n\n"
+        text += "💡 HOURS = 0 သို့မဟုတ် မထည့်ပါက Permanent ban\n"
+        text += "💡 REASON မထည့်လည်း ရပါတယ်"
+        
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("❌ Cancel", callback_data="admin_bans"))
+        
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=markup
+        )
+    
+    elif data == "unban_user_start":
+        if user_id != ADMIN_CHAT_ID:
+            return
+        
+        user_sessions[user_id] = {'action': 'unban_user'}
+        
+        text = "✅ *Unban User*\n\n"
+        text += "Unban လုပ်မည့် User ၏ Telegram ID ထည့်ပါ:"
+        
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("❌ Cancel", callback_data="admin_bans"))
+        
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=markup
+        )
+    
+    elif data == "ban_list":
+        if user_id != ADMIN_CHAT_ID:
+            return
+        
+        banned = get_banned_users()
+        text = "📋 *Banned Users List*\n\n"
+        
+        if not banned:
+            text += "Ban ထားသော user မရှိပါ။ 🎉"
+        else:
+            for i, user in enumerate(banned[:20], 1):  # Limit to 20
+                name = user['username'] or user['first_name'] or f"User"
+                ban_type = "♾️ Permanent" if user['is_permanent'] else f"⏱️ Until {user['banned_until'][:16]}"
+                text += f"{i}. {name} (`{user['telegram_id']}`)\n"
+                text += f"   {ban_type}\n"
+                if user['reason']:
+                    text += f"   📝 {user['reason'][:30]}\n"
+                text += "\n"
+            
+            if len(banned) > 20:
+                text += f"\n... and {len(banned) - 20} more"
+        
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="admin_bans"))
+        
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=markup
+        )
+    
+    elif data.startswith("unban_"):
+        if user_id != ADMIN_CHAT_ID:
+            return
+        
+        target_id = int(data.replace("unban_", ""))
+        if unban_user(target_id, unbanned_by=user_id):
+            bot.answer_callback_query(call.id, f"✅ User {target_id} unbanned!", show_alert=True)
+        else:
+            bot.answer_callback_query(call.id, "❌ Unban failed!", show_alert=True)
+        
+        # Refresh ban list
+        banned = get_banned_users()
+        text = "📋 *Banned Users List*\n\n"
+        
+        if not banned:
+            text += "Ban ထားသော user မရှိပါ။ 🎉"
+        else:
+            for i, user in enumerate(banned[:20], 1):
+                name = user['username'] or user['first_name'] or f"User"
+                ban_type = "♾️ Permanent" if user['is_permanent'] else f"⏱️ Until {user['banned_until'][:16]}"
+                text += f"{i}. {name} (`{user['telegram_id']}`)\n"
+                text += f"   {ban_type}\n"
+                text += "\n"
+        
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="admin_bans"))
+        
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=markup
         )
 
 # ===================== REPLY KEYBOARD BUTTON HANDLERS =====================
@@ -1933,6 +2611,233 @@ def handle_reply_keyboard_buttons(message):
                 reply_markup=main_menu_keyboard()
             )
 
+# ===================== ADMIN TEXT INPUT HANDLER =====================
+
+@bot.message_handler(func=lambda message: message.from_user.id == ADMIN_CHAT_ID and 
+                     message.from_user.id in user_sessions and 
+                     user_sessions.get(message.from_user.id, {}).get('action') in ['ban_user', 'unban_user', 'add_server'])
+def handle_admin_text_input(message):
+    """Handle admin text input for ban/unban/add_server"""
+    user_id = message.from_user.id
+    session = user_sessions.get(user_id, {})
+    action = session.get('action')
+    
+    # ==================== ADD SERVER ====================
+    if action == 'add_server':
+        panel_type = session.get('panel_type', 'xui')
+        text = message.text.strip()
+        
+        try:
+            parts = [p.strip() for p in text.split(',')]
+            
+            if panel_type == 'xui':
+                # Format: server_id,name,url,panel_path,domain,sub_port
+                if len(parts) < 5:
+                    bot.reply_to(message, "❌ Invalid format!\n\nFormat: `server_id,name,url,panel_path,domain,sub_port`", parse_mode='Markdown')
+                    return
+                
+                server_id = parts[0].lower().replace(' ', '_')
+                name = parts[1]
+                url = parts[2]
+                panel_path = parts[3]
+                domain = parts[4]
+                sub_port = int(parts[5]) if len(parts) > 5 else 2096
+                
+                # Validate
+                if server_id in SERVERS:
+                    bot.reply_to(message, f"❌ Server ID `{server_id}` already exists!", parse_mode='Markdown')
+                    user_sessions.pop(user_id, None)
+                    return
+                
+                # Add to database
+                if add_server(
+                    server_id=server_id,
+                    name=name,
+                    url=url,
+                    panel_path=panel_path,
+                    domain=domain,
+                    panel_type='xui',
+                    sub_port=sub_port,
+                    created_by=user_id
+                ):
+                    # Reload servers
+                    load_servers()
+                    
+                    bot.reply_to(
+                        message,
+                        f"✅ *Server Added Successfully!*\n\n"
+                        f"🆔 ID: `{server_id}`\n"
+                        f"📛 Name: {name}\n"
+                        f"🌐 URL: {url}\n"
+                        f"🔧 Panel: 3X-UI\n"
+                        f"📍 Domain: {domain}\n"
+                        f"🔌 Sub Port: {sub_port}\n\n"
+                        f"Server ကို အသုံးပြုနိုင်ပါပြီ!",
+                        parse_mode='Markdown'
+                    )
+                else:
+                    bot.reply_to(message, "❌ Failed to add server! Please try again.")
+                    
+            elif panel_type == 'hiddify':
+                # Format: server_id,name,url,admin_path,domain,api_key,user_sub_path
+                if len(parts) < 6:
+                    bot.reply_to(message, "❌ Invalid format!\n\nFormat: `server_id,name,url,admin_path,domain,api_key,user_sub_path`", parse_mode='Markdown')
+                    return
+                
+                server_id = parts[0].lower().replace(' ', '_')
+                name = parts[1]
+                url = parts[2]
+                admin_path = parts[3]  # panel_path for Hiddify
+                domain = parts[4]
+                api_key = parts[5]
+                user_sub_path = parts[6] if len(parts) > 6 else admin_path
+                
+                # Validate
+                if server_id in SERVERS:
+                    bot.reply_to(message, f"❌ Server ID `{server_id}` already exists!", parse_mode='Markdown')
+                    user_sessions.pop(user_id, None)
+                    return
+                
+                # Add to database
+                if add_server(
+                    server_id=server_id,
+                    name=name,
+                    url=url,
+                    panel_path=admin_path,
+                    domain=domain,
+                    panel_type='hiddify',
+                    api_key=api_key,
+                    admin_uuid=api_key,
+                    proxy_path=admin_path,
+                    user_sub_path=user_sub_path,
+                    created_by=user_id
+                ):
+                    # Reload servers
+                    load_servers()
+                    
+                    bot.reply_to(
+                        message,
+                        f"✅ *Hiddify Server Added Successfully!*\n\n"
+                        f"🆔 ID: `{server_id}`\n"
+                        f"📛 Name: {name}\n"
+                        f"🌐 URL: {url}\n"
+                        f"🔧 Panel: Hiddify\n"
+                        f"📍 Domain: {domain}\n\n"
+                        f"Server ကို အသုံးပြုနိုင်ပါပြီ!",
+                        parse_mode='Markdown'
+                    )
+                else:
+                    bot.reply_to(message, "❌ Failed to add server! Please try again.")
+        
+        except Exception as e:
+            bot.reply_to(message, f"❌ Error: {str(e)}\n\nPlease check the format and try again.")
+        
+        user_sessions.pop(user_id, None)
+        return
+    
+    # ==================== BAN USER ====================
+    elif action == 'ban_user':
+        # Parse: USER_ID HOURS REASON
+        parts = message.text.strip().split(maxsplit=2)
+        
+        try:
+            target_id = int(parts[0])
+        except (ValueError, IndexError):
+            bot.reply_to(message, "❌ Invalid user ID! Format: `USER_ID HOURS REASON`", parse_mode='Markdown')
+            return
+        
+        # Get hours (optional, default = permanent)
+        hours = None
+        reason = None
+        if len(parts) >= 2:
+            try:
+                hours = int(parts[1])
+                if hours == 0:
+                    hours = None  # Permanent
+            except ValueError:
+                # Second part is reason, not hours
+                reason = parts[1]
+        
+        if len(parts) >= 3:
+            reason = parts[2]
+        
+        # Check if user exists
+        target_user = get_user(target_id)
+        if not target_user:
+            bot.reply_to(message, f"⚠️ User {target_id} not found in database. Ban anyway?")
+        
+        # Perform ban
+        if ban_user(target_id, reason=reason, duration_hours=hours, banned_by=user_id):
+            ban_type = f"⏱️ {hours} hours" if hours else "♾️ Permanent"
+            reason_text = f"\n📝 Reason: {reason}" if reason else ""
+            
+            bot.reply_to(
+                message, 
+                f"✅ *User Banned*\n\n"
+                f"👤 User ID: `{target_id}`\n"
+                f"🚫 Ban Type: {ban_type}{reason_text}",
+                parse_mode='Markdown'
+            )
+            
+            # Try to notify the banned user
+            try:
+                ban_msg = "⚠️ *Account Suspended*\n\n"
+                if hours:
+                    ban_msg += f"Your account has been temporarily suspended for {hours} hours.\n"
+                else:
+                    ban_msg += "Your account has been suspended.\n"
+                if reason:
+                    ban_msg += f"\nReason: {reason}"
+                ban_msg += "\n\nContact support if you believe this is a mistake."
+                bot.send_message(target_id, ban_msg, parse_mode='Markdown')
+            except:
+                pass  # User may have blocked the bot
+        else:
+            bot.reply_to(message, "❌ Ban failed! Please try again.")
+        
+        # Clear session
+        user_sessions.pop(user_id, None)
+    
+    elif action == 'unban_user':
+        try:
+            target_id = int(message.text.strip())
+        except ValueError:
+            bot.reply_to(message, "❌ Invalid user ID!")
+            return
+        
+        # Check if user is actually banned
+        ban_info = is_user_banned_db(target_id)
+        if not ban_info:
+            bot.reply_to(message, f"⚠️ User {target_id} is not banned.")
+            user_sessions.pop(user_id, None)
+            return
+        
+        # Perform unban
+        if unban_user(target_id, unbanned_by=user_id):
+            bot.reply_to(
+                message,
+                f"✅ *User Unbanned*\n\n"
+                f"👤 User ID: `{target_id}`",
+                parse_mode='Markdown'
+            )
+            
+            # Try to notify the user
+            try:
+                bot.send_message(
+                    target_id,
+                    "✅ *Account Restored*\n\n"
+                    "Your account has been unbanned. You can now use the bot again.\n\n"
+                    "Type /start to continue.",
+                    parse_mode='Markdown'
+                )
+            except:
+                pass
+        else:
+            bot.reply_to(message, "❌ Unban failed! Please try again.")
+        
+        # Clear session
+        user_sessions.pop(user_id, None)
+
 @bot.message_handler(content_types=['photo'])
 def handle_photo(message):
     """Handle payment screenshots with OCR verification"""
@@ -2015,11 +2920,14 @@ def handle_photo(message):
     ocr_verified = False
     ocr_amount = None
     
-    if OCR_ENABLED and AUTO_APPROVE_ENABLED:
+    # Check if auto-approve feature is enabled via feature flags
+    auto_approve_enabled = OCR_ENABLED and AUTO_APPROVE_ENABLED and feature_flags.get('auto_approve', True)
+    
+    if auto_approve_enabled:
         bot.reply_to(message, "⏳ Screenshot စစ်ဆေးနေပါသည်...")
         
         try:
-            ocr_result = process_payment_screenshot(bot, file_id, expected_amount)
+            ocr_result = process_payment_screenshot(bot, file_id, expected_amount, user_id=user_id)
             ocr_verified = ocr_result.get('verified', False)
             ocr_amount = ocr_result.get('ocr_amount')
             logger.info(f"OCR Result for order {order_id}: verified={ocr_verified}, amount={ocr_amount}, expected={expected_amount}")
@@ -2097,8 +3005,8 @@ def handle_photo(message):
             parse_mode='Markdown'
         )
         
-        # Setup auto-approve timer if OCR verified
-        if ocr_verified and AUTO_APPROVE_ENABLED:
+        # Setup auto-approve timer if OCR verified and feature enabled
+        if ocr_verified and AUTO_APPROVE_ENABLED and feature_flags.get('auto_approve', True):
             setup_auto_approve_timer(
                 order_id=order_id,
                 customer_id=user_id,
@@ -2566,14 +3474,24 @@ def auto_approve_order(order_id):
             # Process referral reward
             process_referral_on_purchase(customer_id, order_id)
             
-            # Update admin message
+            # Update admin message with full order details
             try:
                 # Escape underscores for Markdown
                 safe_username = str(customer_username).replace('_', '\\_')
+                safe_client_email = str(result['client_email']).replace('_', '\\_')
+                expiry_str = result['expiry_date'].strftime('%Y-%m-%d %H:%M')
+                data_limit_str = "Unlimited" if plan['data_limit'] == 0 else f"{plan['data_limit']} GB"
+                
                 bot.edit_message_caption(
                     caption=f"🤖 *AUTO-APPROVED* Order #{order_id}\n\n"
-                            f"✅ Key sent to @{safe_username} ({customer_id})\n"
-                            f"💰 Amount: {approval_data['ocr_amount']:,} Ks (OCR verified)",
+                            f"👤 User: @{safe_username} (`{customer_id}`)\n"
+                            f"🖥️ Server: {SERVERS[server_id]['name']}\n"
+                            f"📦 Plan: {plan['name']}\n"
+                            f"💰 Amount: {approval_data['ocr_amount']:,} Ks\n"
+                            f"📅 Expiry: {expiry_str}\n"
+                            f"📊 Data: {data_limit_str}\n"
+                            f"🔑 Key: `{safe_client_email}`\n\n"
+                            f"✅ OCR Verified & Key sent to user",
                     chat_id=PAYMENT_CHANNEL_ID,
                     message_id=approval_data['admin_message_id'],
                     parse_mode='Markdown'
@@ -2656,17 +3574,170 @@ def log_auto_approval(order_id, customer_id, ocr_amount, result):
         logger.error(f"Error logging auto-approval: {e}")
 
 
+# ===================== AUTO BACKUP SYSTEM =====================
+
+# Yangon timezone
+YANGON_TZ = pytz.timezone('Asia/Yangon')
+backup_timer = None
+
+def create_backup():
+    """Create a backup of the database file"""
+    try:
+        yangon_now = datetime.now(YANGON_TZ)
+        backup_filename = f"vpn_bot_backup_{yangon_now.strftime('%Y%m%d_%H%M%S')}.db"
+        backup_path = os.path.join(os.path.dirname(DATABASE_PATH), backup_filename)
+        
+        # Copy database file
+        shutil.copy2(DATABASE_PATH, backup_path)
+        
+        logger.info(f"📦 Backup created: {backup_filename}")
+        return backup_path, backup_filename
+    except Exception as e:
+        logger.error(f"Backup creation failed: {e}")
+        return None, None
+
+def send_backup_to_channel():
+    """Send backup file to payment channel"""
+    try:
+        backup_path, backup_filename = create_backup()
+        
+        if not backup_path:
+            logger.error("Failed to create backup")
+            return False
+        
+        yangon_now = datetime.now(YANGON_TZ)
+        
+        # Get statistics for the backup message
+        stats = get_statistics('all')
+        
+        caption = f"""🔒 *Daily Database Backup*
+
+📅 Date: {yangon_now.strftime('%Y-%m-%d')}
+⏰ Time: {yangon_now.strftime('%H:%M:%S')} (Myanmar Time)
+
+📊 *Database Statistics:*
+👥 Total Users: {stats['total_users']:,}
+🛒 Total Orders: {stats['total_orders']:,}
+✅ Completed: {stats['completed_orders']:,}
+💰 Total Revenue: {stats['total_revenue']:,} Ks
+🔑 Active Keys: {stats['active_keys']:,}
+
+_Auto-backup by VPN Bot System_"""
+        
+        # Send backup file to payment channel
+        with open(backup_path, 'rb') as backup_file:
+            bot.send_document(
+                PAYMENT_CHANNEL_ID,
+                backup_file,
+                caption=caption,
+                parse_mode='Markdown'
+            )
+        
+        logger.info(f"✅ Backup sent to payment channel: {backup_filename}")
+        
+        # Clean up backup file after sending
+        try:
+            os.remove(backup_path)
+            logger.info(f"🗑️ Backup file cleaned up: {backup_filename}")
+        except:
+            pass
+        
+        return True
+    except Exception as e:
+        logger.error(f"Failed to send backup: {e}")
+        return False
+
+def schedule_next_backup():
+    """Schedule the next midnight backup"""
+    global backup_timer
+    
+    # Get current time in Yangon
+    yangon_now = datetime.now(YANGON_TZ)
+    
+    # Calculate next midnight
+    next_midnight = yangon_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if yangon_now >= next_midnight:
+        next_midnight += timedelta(days=1)
+    
+    # Calculate seconds until next midnight
+    seconds_until_midnight = (next_midnight - yangon_now).total_seconds()
+    
+    logger.info(f"⏰ Next backup scheduled in {seconds_until_midnight/3600:.1f} hours ({next_midnight.strftime('%Y-%m-%d %H:%M')} MMT)")
+    
+    # Cancel existing timer if any
+    if backup_timer:
+        backup_timer.cancel()
+    
+    # Schedule backup
+    backup_timer = threading.Timer(seconds_until_midnight, run_midnight_backup)
+    backup_timer.daemon = True
+    backup_timer.start()
+
+def run_midnight_backup():
+    """Run midnight backup and schedule next one"""
+    logger.info("🌙 Midnight backup starting...")
+    
+    # Send backup
+    success = send_backup_to_channel()
+    
+    if success:
+        logger.info("✅ Midnight backup completed successfully")
+    else:
+        logger.error("❌ Midnight backup failed")
+        # Notify admin
+        try:
+            bot.send_message(
+                ADMIN_CHAT_ID,
+                "⚠️ *Backup Failed*\n\n"
+                "Midnight auto-backup failed. Please check the logs.",
+                parse_mode='Markdown'
+            )
+        except:
+            pass
+    
+    # Schedule next backup
+    schedule_next_backup()
+
+def manual_backup():
+    """Trigger manual backup (admin command)"""
+    return send_backup_to_channel()
+
+
 def main():
     """Main function to run the bot"""
     # Initialize database
     init_db()
+    
+    # Load servers from config + database
+    load_servers()
+    
+    # Load feature flags from database
+    load_feature_flags()
+    
+    # Setup DDoS auto-block callback to database
+    def db_ban_wrapper(user_id, reason, hours):
+        """Wrapper to ban user in database"""
+        try:
+            ban_user(user_id, reason=reason, duration_hours=hours, banned_by=0)  # 0 = system
+            logger.info(f"🔒 DDoS auto-block: User {user_id} banned in database for {hours}h - {reason}")
+        except Exception as e:
+            logger.error(f"Failed to persist DDoS ban: {e}")
+    
+    rate_limiter.set_db_ban_callback(db_ban_wrapper)
     
     # Security initialization
     print("🔒 Security features enabled:")
     print("   ├ Rate limiting: ✅")
     print("   ├ Input validation: ✅")
     print("   ├ Callback validation: ✅")
-    print("   └ Abuse detection: ✅")
+    print("   ├ Abuse detection: ✅")
+    print("   └ DDoS Auto-Block: ✅")
+    
+    # Feature flags status
+    print("📋 Feature Flags:")
+    for flag_name, is_enabled in feature_flags.items():
+        status = "✅" if is_enabled else "❌"
+        print(f"   ├ {flag_name}: {status}")
     
     # OCR and Auto-approve status
     if OCR_ENABLED:
@@ -2678,6 +3749,10 @@ def main():
         print(f"⏱️ Auto-Approve: ✅ ({AUTO_APPROVE_TIMEOUT} seconds timeout)")
     else:
         print("⏱️ Auto-Approve: ❌")
+    
+    # Start auto backup scheduler
+    print("📦 Auto Backup: ✅ (Daily at 00:00 MMT)")
+    schedule_next_backup()
     
     # Start the bot
     print("🚀 VPN Seller Bot started!")

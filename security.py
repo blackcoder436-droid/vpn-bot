@@ -18,21 +18,29 @@ logger = logging.getLogger(__name__)
 # ===================== RATE LIMITING =====================
 
 class RateLimiter:
-    """Enhanced rate limiter to prevent spam, DDoS and abuse"""
+    """Enhanced rate limiter to prevent spam, DDoS and abuse with auto-block"""
     
     def __init__(self):
         # Store: {user_id: [(timestamp, action_type), ...]}
         self.user_actions: Dict[int, list] = defaultdict(list)
-        self.banned_users: Dict[int, datetime] = {}  # Temporary bans
+        self.banned_users: Dict[int, datetime] = {}  # Temporary bans (runtime)
         self.ip_tracking: Dict[str, list] = defaultdict(list)  # IP-based tracking
         self.global_request_count = 0
         self.global_request_window_start = time.time()
         self._lock = threading.Lock()
         
+        # DDoS detection tracking
+        self.ddos_suspects: Dict[int, dict] = defaultdict(lambda: {
+            'request_count': 0,
+            'first_request': 0,
+            'violations': 0,
+            'last_violation': 0
+        })
+        
         # Rate limits configuration - Stricter limits for DDoS protection
         self.limits = {
-            'message': {'count': 20, 'period': 60},      # 20 messages per minute
-            'callback': {'count': 40, 'period': 60},     # 40 callbacks per minute
+            'message': {'count': 15, 'period': 60},      # 15 messages per minute
+            'callback': {'count': 30, 'period': 60},     # 30 callbacks per minute
             'free_test': {'count': 1, 'period': 86400},  # 1 free test per day
             'order': {'count': 5, 'period': 3600},       # 5 orders per hour
             'screenshot': {'count': 3, 'period': 300},   # 3 screenshots per 5 minutes
@@ -41,14 +49,22 @@ class RateLimiter:
         }
         
         # DDoS Protection settings
-        self.global_limit = 1000          # Max global requests per minute
-        self.burst_limit = 50             # Max burst requests per second
+        self.global_limit = 500           # Max global requests per minute (reduced)
+        self.burst_limit = 30             # Max burst requests per second (reduced)
         self.burst_window = []            # Track burst requests
         
-        # Ban thresholds
-        self.spam_threshold = 80          # Actions in 60 seconds to trigger ban
-        self.ban_duration = 600           # 10 minutes ban (increased from 5)
-        self.severe_ban_duration = 3600   # 1 hour for severe violations
+        # Auto-ban thresholds (stricter)
+        self.spam_threshold = 50          # Actions in 60 seconds to trigger ban
+        self.ban_duration = 1800          # 30 minutes ban (increased)
+        self.severe_ban_duration = 7200   # 2 hours for severe violations
+        
+        # DDoS auto-block settings
+        self.ddos_threshold = 60          # Requests per minute to consider DDoS
+        self.ddos_violation_threshold = 3 # Violations before permanent ban
+        self.ddos_window = 10             # Seconds to track rapid requests
+        
+        # Callback for database ban (set by bot.py)
+        self.db_ban_callback = None
         
     def _cleanup_old_actions(self, user_id: int, period: int):
         """Remove actions older than the specified period"""
@@ -67,23 +83,36 @@ class RateLimiter:
                 del self.banned_users[user_id]
         return False
     
-    def ban_user(self, user_id: int, duration: int = None, reason: str = "rate_limit"):
-        """Ban a user temporarily"""
+    def ban_user(self, user_id: int, duration: int = None, reason: str = "rate_limit", persist_to_db: bool = False):
+        """Ban a user temporarily, optionally persist to database"""
         if duration is None:
             duration = self.ban_duration
         self.banned_users[user_id] = datetime.now() + timedelta(seconds=duration)
-        logger.warning(f"User {user_id} banned for {duration}s - Reason: {reason}")
+        logger.warning(f"🚫 User {user_id} banned for {duration}s - Reason: {reason}")
+        
+        # Persist to database if callback is set and persist_to_db is True
+        if persist_to_db and self.db_ban_callback:
+            try:
+                hours = duration / 3600  # Convert seconds to hours
+                self.db_ban_callback(user_id, reason, hours if hours > 0 else None)
+                logger.warning(f"📦 User {user_id} ban persisted to database")
+            except Exception as e:
+                logger.error(f"Failed to persist ban to database: {e}")
     
-    def check_ddos_protection(self) -> bool:
-        """Check global rate limits for DDoS protection"""
+    def set_db_ban_callback(self, callback):
+        """Set callback function for database bans"""
+        self.db_ban_callback = callback
+    
+    def check_ddos_protection(self, user_id: int = None) -> tuple[bool, str]:
+        """Check global rate limits for DDoS protection with user tracking"""
         with self._lock:
             current_time = time.time()
             
             # Check burst protection (requests per second)
             self.burst_window = [t for t in self.burst_window if current_time - t < 1]
             if len(self.burst_window) >= self.burst_limit:
-                logger.critical(f"DDOS ALERT: Burst limit exceeded - {len(self.burst_window)} req/sec")
-                return False
+                logger.critical(f"🚨 DDOS ALERT: Burst limit exceeded - {len(self.burst_window)} req/sec")
+                return False, "burst_exceeded"
             self.burst_window.append(current_time)
             
             # Check global rate (requests per minute)
@@ -93,24 +122,75 @@ class RateLimiter:
             
             self.global_request_count += 1
             if self.global_request_count > self.global_limit:
-                logger.critical(f"DDOS ALERT: Global limit exceeded - {self.global_request_count} req/min")
-                return False
+                logger.critical(f"🚨 DDOS ALERT: Global limit exceeded - {self.global_request_count} req/min")
+                return False, "global_exceeded"
             
-            return True
+            # Track per-user DDoS patterns
+            if user_id:
+                return self._check_user_ddos_pattern(user_id, current_time)
+            
+            return True, ""
+    
+    def _check_user_ddos_pattern(self, user_id: int, current_time: float) -> tuple[bool, str]:
+        """Check if a specific user is exhibiting DDoS-like behavior"""
+        suspect = self.ddos_suspects[user_id]
+        
+        # Reset counter if window expired
+        if current_time - suspect['first_request'] > self.ddos_window:
+            suspect['request_count'] = 0
+            suspect['first_request'] = current_time
+        
+        suspect['request_count'] += 1
+        
+        # Check if user exceeds DDoS threshold
+        requests_per_sec = suspect['request_count'] / max(1, current_time - suspect['first_request'])
+        
+        if requests_per_sec > 5:  # More than 5 requests per second
+            suspect['violations'] += 1
+            suspect['last_violation'] = current_time
+            
+            logger.warning(f"🚨 DDoS Pattern Detected: User {user_id} - {requests_per_sec:.1f} req/sec, Violations: {suspect['violations']}")
+            
+            if suspect['violations'] >= self.ddos_violation_threshold:
+                # Severe violation - long ban + persist to database
+                self.ban_user(user_id, self.severe_ban_duration * 2, "ddos_attack", persist_to_db=True)
+                logger.critical(f"🚫 AUTO-BLOCKED: User {user_id} for DDoS attack (persisted to DB)")
+                return False, "ddos_autoblock"
+            elif suspect['violations'] >= 2:
+                # Medium violation
+                self.ban_user(user_id, self.severe_ban_duration, "ddos_suspected")
+                return False, "ddos_banned"
+            else:
+                # First violation - warning
+                self.ban_user(user_id, self.ban_duration, "rapid_requests")
+                return False, "rate_warned"
+        
+        return True, ""
     
     def check_rate_limit(self, user_id: int, action_type: str = 'message') -> tuple[bool, str]:
         """
-        Check if user has exceeded rate limit
+        Check if user has exceeded rate limit with DDoS auto-block
         Returns: (is_allowed, error_message)
         """
-        # Check global DDoS protection first
-        if not self.check_ddos_protection():
+        # Check global DDoS protection first (with user tracking)
+        ddos_ok, ddos_reason = self.check_ddos_protection(user_id)
+        if not ddos_ok:
+            if ddos_reason == "ddos_autoblock":
+                return False, "🚫 သင့် Account ကို DDoS attack ကြောင့် block လုပ်ထားပါသည်။"
+            elif ddos_reason == "ddos_banned":
+                return False, "⚠️ Request များအလွန်အကျွံ ပို့နေပါသည်! 2 နာရီ block ခံရပါမည်။"
+            elif ddos_reason == "rate_warned":
+                return False, "⚠️ Request များ အများကြီး ပို့နေပါသည်! 30 မိနစ် ယာယီ block ခံရပါမည်။"
             return False, "⚠️ Server is busy. Please try again later."
         
         # Check if user is banned
         if self.is_banned(user_id):
             remaining = (self.banned_users[user_id] - datetime.now()).seconds
-            return False, f"⚠️ သင် ယာယီ block ခံထားရပါသည်။ {remaining} စက္ကန့် စောင့်ပါ။"
+            minutes = remaining // 60
+            seconds = remaining % 60
+            if minutes > 0:
+                return False, f"⚠️ သင် ယာယီ block ခံထားရပါသည်။ {minutes} မိနစ် {seconds} စက္ကန့် စောင့်ပါ။"
+            return False, f"⚠️ သင် ယာယီ block ခံထားရပါသည်။ {seconds} စက္ကန့် စောင့်ပါ။"
         
         current_time = time.time()
         
@@ -126,15 +206,22 @@ class RateLimiter:
             if action == action_type
         )
         
-        # Check spam (any action type)
+        # Check spam (any action type) - stricter threshold
         total_actions = len(self.user_actions[user_id])
         if total_actions >= self.spam_threshold:
-            # Ban user temporarily
-            self.ban_user(user_id, self.severe_ban_duration, "spam_detected")
-            return False, "⚠️ Request များ အများကြီး ပို့နေပါသည်! 1 နာရီ ယာယီ block ခံရပါမည်။"
+            # Ban user and persist to database for repeated offenders
+            persist = total_actions >= self.spam_threshold * 1.5  # Persist if 1.5x threshold
+            self.ban_user(user_id, self.severe_ban_duration, "spam_detected", persist_to_db=persist)
+            return False, "⚠️ Request များ အများကြီး ပို့နေပါသည်! 2 နာရီ ယာယီ block ခံရပါမည်။"
+        
+        # Warning at 80% of threshold
+        if total_actions >= self.spam_threshold * 0.8:
+            logger.warning(f"⚠️ User {user_id} approaching spam threshold: {total_actions}/{self.spam_threshold}")
         
         # Check specific rate limit
         if action_count >= limit_config['count']:
+            # Record violation for DDoS tracking
+            self.ddos_suspects[user_id]['violations'] += 1
             return False, f"⚠️ Rate limit ကျော်နေပါသည်။ ခဏနေ ပြန်စမ်းပါ။"
         
         # Record this action
@@ -519,6 +606,21 @@ VALID_CALLBACK_PREFIXES = [
     'approve_',
     'reject_',
     'toggle_server_',
+    'toggle_feature_',
+    # Statistics callbacks
+    'stats_',
+    # Ban management callbacks
+    'ban_user_start',
+    'unban_user_start',
+    'ban_list',
+    'unban_',
+    # Server management callbacks
+    'add_server_start',
+    'add_server_xui',
+    'add_server_hiddify',
+    'delete_server_start',
+    'confirm_delete_server_',
+    'do_delete_server_',
 ]
 
 def is_valid_callback(callback_data: str) -> bool:
