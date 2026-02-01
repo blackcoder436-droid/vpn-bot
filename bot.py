@@ -207,8 +207,16 @@ def check_channel_membership(user_id):
     """Check if user is a member of the required channel"""
     try:
         member = bot.get_chat_member(REQUIRED_CHANNEL_ID, user_id)
+        logger.info(f"Channel membership check for {user_id}: status={member.status}")
         # User is a member if status is creator, administrator, member, or restricted
         return member.status in ['creator', 'administrator', 'member', 'restricted']
+    except telebot.apihelper.ApiTelegramException as e:
+        if "bot is not a member" in str(e).lower() or "chat not found" in str(e).lower():
+            logger.error(f"Bot is not admin in channel {REQUIRED_CHANNEL_ID}. Please add bot as admin!")
+            # Return True temporarily if bot can't check (admin needs to add bot to channel)
+            return True  # Allow access if bot can't verify
+        logger.warning(f"Telegram API error checking membership for {user_id}: {e}")
+        return False
     except Exception as e:
         logger.warning(f"Failed to check channel membership for {user_id}: {e}")
         return False
