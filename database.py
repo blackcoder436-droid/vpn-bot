@@ -623,26 +623,30 @@ def get_referral_stats(telegram_id):
     cursor.execute('''
         SELECT COUNT(*) FROM referrals WHERE referrer_id = ?
     ''', (telegram_id,))
-    total_referred = cursor.fetchone()[0]
+    result = cursor.fetchone()
+    total_referred = result[0] if result else 0
     
     # Paid referrals (referred users who made a purchase)
     cursor.execute('''
         SELECT COUNT(*) FROM referrals WHERE referrer_id = ? AND is_paid = 1
     ''', (telegram_id,))
-    paid_referrals = cursor.fetchone()[0]
+    result = cursor.fetchone()
+    paid_referrals = result[0] if result else 0
     
     # Get bonus Days
     cursor.execute('''
         SELECT COALESCE(referral_bonus_days, 0) FROM users WHERE telegram_id = ?
     ''', (telegram_id,))
-    bonus_days = cursor.fetchone()[0] or 0
+    result = cursor.fetchone()
+    bonus_days = result[0] if result else 0
     
     # Get claimed free months
     cursor.execute('''
         SELECT COUNT(*) FROM referral_rewards 
         WHERE telegram_id = ? AND reward_type = 'free_month'
     ''', (telegram_id,))
-    claimed_free_months = cursor.fetchone()[0]
+    result = cursor.fetchone()
+    claimed_free_months = result[0] if result else 0
     
     conn.close()
     
