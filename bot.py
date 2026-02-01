@@ -97,8 +97,12 @@ def server_keyboard(for_free=False):
         # Skip disabled servers
         if server_id in disabled_servers:
             continue
+        # Add panel type indicator
+        panel_type = server.get('panel_type', 'xui').upper()
+        panel_icon = '🔷' if panel_type == 'HIDDIFY' else '🔸'
+        server_name = f"{server['name']} {panel_icon}"
         callback_data = f"free_server_{server_id}" if for_free else f"server_{server_id}"
-        markup.add(types.InlineKeyboardButton(server['name'], callback_data=callback_data))
+        markup.add(types.InlineKeyboardButton(server_name, callback_data=callback_data))
     markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="main_menu"))
     return markup
 

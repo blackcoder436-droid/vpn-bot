@@ -24,13 +24,19 @@ PAYMENT_CHANNEL_ID = int(os.environ.get('PAYMENT_CHANNEL_ID', '0'))
 XUI_USERNAME = os.environ.get('XUI_USERNAME', '')
 XUI_PASSWORD = os.environ.get('XUI_PASSWORD', '')
 
+# Hiddify Panel Credentials (from environment variables)
+HIDDIFY_API_KEY = os.environ.get('HIDDIFY_API_KEY', '')
+HIDDIFY_ADMIN_UUID = os.environ.get('HIDDIFY_ADMIN_UUID', '')
+
 # Validate required credentials
 if not BOT_TOKEN:
     raise ValueError("❌ BOT_TOKEN is required! Set it in .env file.")
 if not ADMIN_CHAT_ID:
     raise ValueError("❌ ADMIN_CHAT_ID is required! Set it in .env file.")
 if not XUI_USERNAME or not XUI_PASSWORD:
-    raise ValueError("❌ XUI credentials are required! Set them in .env file.")
+    print("⚠️ Warning: XUI credentials not set. XUI panel features will be disabled.")
+if not HIDDIFY_API_KEY:
+    print("⚠️ Warning: Hiddify API key not set. Hiddify panel features will be disabled.")
 
 # Server List
 SERVERS = {
@@ -39,21 +45,34 @@ SERVERS = {
         "url": "https://jan.burmesedigital.store:8080",
         "panel_path": "/mka",
         "domain": "jan.burmesedigital.store",
-        "sub_port": 2096
+        "sub_port": 2096,
+        "panel_type": "xui"  # xui or hiddify
     },
     "sg2": {
         "name": "🇸🇬 Singapore 2", 
         "url": "https://sg2.burmesedigital.store:8080",
         "panel_path": "/mka",
         "domain": "sg2.burmesedigital.store",
-        "sub_port": 2096
+        "sub_port": 2096,
+        "panel_type": "xui"
     },
     "sg3": {
         "name": "🇸🇬 Singapore 3",
         "url": "https://sg3.burmesedigital.store:8080",
         "panel_path": "/mka",
         "domain": "sg3.burmesedigital.store",
-        "sub_port": 2096
+        "sub_port": 2096,
+        "panel_type": "xui"
+    },
+    "hiddify1": {
+        "name": "🌐 Hiddify Main",
+        "url": "https://main.burmesedigital.store",
+        "panel_path": "SeS1TFUTYLdZXv7F",
+        "domain": "main.burmesedigital.store",
+        "panel_type": "hiddify",
+        "api_key": HIDDIFY_API_KEY if HIDDIFY_API_KEY else "c0ac46c4-7da2-44cd-89e8-be68e24ba01b",
+        "admin_uuid": HIDDIFY_ADMIN_UUID if HIDDIFY_ADMIN_UUID else "c0ac46c4-7da2-44cd-89e8-be68e24ba01b",
+        "proxy_path": "SeS1TFUTYLdZXv7F"
     }
 }
 

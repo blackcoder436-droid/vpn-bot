@@ -365,30 +365,7 @@ class XUIApi:
             return False
 
 
-def create_vpn_key(server_id, telegram_id, username, data_limit_gb=0, expiry_days=30, devices=1, protocol='trojan', expiry_timestamp=None, key_number=1):
-    """Helper function to create VPN key"""
-    api = XUIApi(server_id)
-    return api.create_client(telegram_id, username, data_limit_gb, expiry_days, devices, protocol, expiry_timestamp, key_number)
-
-
-def get_available_protocols(server_id):
-    """Helper function to get available protocols"""
-    api = XUIApi(server_id)
-    return api.get_available_protocols()
-
-
-def verify_client_exists(server_id, client_email):
-    """Check if a client exists in the 3x-ui panel"""
-    api = XUIApi(server_id)
-    if not api.login():
-        return None  # Can't verify
-    
-    client_info = api.get_client_by_email(client_email)
-    if client_info:
-        return client_info
-    return None
-
-
+# Old helper functions - kept for backward compatibility
 def get_all_panel_clients(server_id):
     """Get all clients from a server's panel"""
     api = XUIApi(server_id)
@@ -410,8 +387,9 @@ def get_all_panel_clients(server_id):
     return all_clients
 
 
-def delete_vpn_client(server_id, client_email):
-    """Helper function to delete VPN client from panel"""
+# Old delete_vpn_client kept for backward compatibility with XUI only
+def delete_vpn_client_xui(server_id, client_email):
+    """Delete VPN client from XUI panel (old implementation)"""
     api = XUIApi(server_id)
     if not api.login():
         return False
@@ -481,3 +459,133 @@ if __name__ == "__main__":
         
         protocols = api.get_available_protocols()
         print(f"Available protocols: {protocols}")
+
+
+# ===================== UNIFIED API =====================
+# Unified interface to support both XUI and Hiddify panels
+
+def create_vpn_key(server_id, telegram_id, username, data_limit, expiry_days, devices, protocol='trojan', key_number=1):
+    """Create VPN key - automatically detects panel type"""
+    from config import SERVERS
+    
+    server = SERVERS.get(server_id)
+    if not server:
+        print(f"❌ Server {server_id} not found")
+        return None
+    
+    panel_type = server.get('panel_type', 'xui')
+    
+    if panel_type == 'hiddify':
+        from hiddify_api import create_vpn_key_hiddify
+        return create_vpn_key_hiddify(server_id, telegram_id, username, data_limit, expiry_days, devices, key_number)
+    else:
+        # Use XUI
+        api = XUIApi(server_id)
+        if not api.login():
+            return None
+        return api.create_client(telegram_id, username, data_limit, expiry_days, devices, protocol, key_number=key_number)
+
+
+def delete_vpn_client(server_id, client_id):
+    """Delete VPN client - automatically detects panel type"""
+    from config import SERVERS
+    
+    server = SERVERS.get(server_id)
+    if not server:
+        print(f"❌ Server {server_id} not found")
+        return False
+    
+    panel_type = server.get('panel_type', 'xui')
+    
+    if panel_type == 'hiddify':
+        from hiddify_api import delete_vpn_user_hiddify
+        return delete_vpn_user_hiddify(server_id, client_id)
+    else:
+        # Use XUI - existing implementation
+        api = XUIApi(server_id)
+        if not api.login():
+            return False
+        
+        inbounds = api.get_inbounds()
+        if not inbounds:
+            return False
+        
+        for inbound in inbounds:
+            settings = json.loads(inbound.get('settings', '{}'))
+            clients = settings.get('clients', [])
+            
+            for client in clients:
+                client_uuid = client.get('id') or client.get('password')
+                if client_uuid == client_id or client.get('email') == client_id:
+                    inbound_id = inbound['id']
+                    client_email = client.get('email')
+                    
+                    try:
+                        url = f"{api.base_url}/panel/api/inbounds/{inbound_id}/delClient/{client_uuid}"
+                        response = api.session.post(url)
+                        result = response.json()
+                        
+                        if result.get('success'):
+                            print(f"✅ Deleted client {client_email}")
+                            return True
+                    except Exception as e:
+                        print(f"❌ Error deleting client: {e}")
+        
+        return False
+
+
+def verify_client_exists(server_id, client_id):
+    """Verify if client exists - automatically detects panel type"""
+    from config import SERVERS
+    
+    server = SERVERS.get(server_id)
+    if not server:
+        return False
+    
+    panel_type = server.get('panel_type', 'xui')
+    
+    if panel_type == 'hiddify':
+        from hiddify_api import verify_user_exists_hiddify
+        return verify_user_exists_hiddify(server_id, client_id)
+    else:
+        # Use XUI - existing implementation
+        api = XUIApi(server_id)
+        if not api.login():
+            return False
+        
+        inbounds = api.get_inbounds()
+        if not inbounds:
+            return False
+        
+        for inbound in inbounds:
+            settings = json.loads(inbound.get('settings', '{}'))
+            clients = settings.get('clients', [])
+            
+            for client in clients:
+                client_uuid = client.get('id') or client.get('password')
+                if client_uuid == client_id or client.get('email') == client_id:
+                    return True
+        
+        return False
+
+
+def get_available_protocols(server_id):
+    """Get available protocols - automatically detects panel type"""
+    from config import SERVERS
+    
+    server = SERVERS.get(server_id)
+    if not server:
+        return []
+    
+    panel_type = server.get('panel_type', 'xui')
+    
+    if panel_type == 'hiddify':
+        from hiddify_api import get_available_protocols_hiddify
+        return get_available_protocols_hiddify(server_id)
+    else:
+        # Use XUI
+        api = XUIApi(server_id)
+        if not api.login():
+            return []
+        return api.get_available_protocols()
+
