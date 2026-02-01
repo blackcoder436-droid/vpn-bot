@@ -2539,9 +2539,11 @@ def auto_approve_order(order_id):
             
             # Update admin message
             try:
+                # Escape underscores for Markdown
+                safe_username = str(customer_username).replace('_', '\\_')
                 bot.edit_message_caption(
                     caption=f"🤖 *AUTO-APPROVED* Order #{order_id}\n\n"
-                            f"✅ Key sent to @{customer_username} ({customer_id})\n"
+                            f"✅ Key sent to @{safe_username} ({customer_id})\n"
                             f"💰 Amount: {approval_data['ocr_amount']:,} Ks (OCR verified)",
                     chat_id=PAYMENT_CHANNEL_ID,
                     message_id=approval_data['admin_message_id'],
@@ -2604,6 +2606,9 @@ def log_auto_approval(order_id, customer_id, ocr_amount, result):
             f"Order #{order_id} auto-approved for user {customer_id}, amount: {ocr_amount} Ks"
         )
         
+        # Escape underscores for Markdown
+        safe_client_email = str(result.get('client_email', '')).replace('_', '\\_')
+        
         # Also send to admin for later review
         bot.send_message(
             ADMIN_CHAT_ID,
@@ -2611,7 +2616,7 @@ def log_auto_approval(order_id, customer_id, ocr_amount, result):
             f"🆔 Order: #{order_id}\n"
             f"👤 User: {customer_id}\n"
             f"💰 OCR Amount: {ocr_amount:,} Ks\n"
-            f"🔑 Key: {result.get('client_email')}\n"
+            f"🔑 Key: {safe_client_email}\n"
             f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
             f"_Admin နောက်မှ verify လုပ်ပါ။ မှားရင် Key disable လုပ်ပါ။_",
             parse_mode='Markdown'
