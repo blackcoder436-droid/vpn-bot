@@ -1486,6 +1486,24 @@ _App မှာ Subscription Link ထည့်ပြီး အသုံးပြ�
             bot.answer_callback_query(call.id, "Order not found!", show_alert=True)
             return
         
+        # Check if order is already approved
+        if order[6] != 'pending':  # status column
+            safe_username = str(customer_id)
+            customer = get_user(customer_id)
+            if customer and customer[2]:
+                safe_username = str(customer[2]).replace('_', '\\_')
+            
+            bot.edit_message_caption(
+                caption=f"ℹ️ *Order #{order_id} Already Processed*\n\n"
+                        f"👤 User: @{safe_username} ({customer_id})\n"
+                        f"📊 Status: {order[6]}\n\n"
+                        f"_This order was already handled._",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                parse_mode='Markdown'
+            )
+            return
+        
         # Cancel auto-approve timer if exists
         cancel_auto_approve(order_id)
         
@@ -2558,17 +2576,42 @@ def auto_approve_order(order_id):
             logger.info(f"✅ Order #{order_id} auto-approved successfully")
             
         else:
-            logger.error(f"❌ Failed to create key for auto-approve order #{order_id}")
-            # Notify admin about failure
-            try:
-                bot.send_message(
-                    ADMIN_CHAT_ID,
-                    f"⚠️ Auto-approve failed for order #{order_id}\n"
-                    f"User: {customer_id}\n"
-                    f"Please review manually."
-                )
-            except:
-                pass
+            # Check if it's a duplicate key error (key already exists)
+            error_msg = result.get('error', '') if result else ''
+            if 'Duplicate' in error_msg or 'duplicate' in error_msg:
+                logger.warning(f"⚠️ Duplicate key detected for order #{order_id}, marking as approved")
+                # Key already exists - mark order as approved
+                approve_order(order_id, 0)
+                
+                # Update admin message to show it was already processed
+                try:
+                    safe_username = str(customer_username).replace('_', '\\_')
+                    bot.edit_message_caption(
+                        caption=f"🤖 *AUTO-APPROVED* Order #{order_id}\n\n"
+                                f"✅ Key already exists for @{safe_username} ({customer_id})\n"
+                                f"💰 Amount: {approval_data['ocr_amount']:,} Ks (OCR verified)\n\n"
+                                f"_Key was created earlier_",
+                        chat_id=PAYMENT_CHANNEL_ID,
+                        message_id=approval_data['admin_message_id'],
+                        parse_mode='Markdown'
+                    )
+                except Exception as e:
+                    logger.error(f"Error updating admin message for duplicate: {e}")
+                
+                logger.info(f"✅ Order #{order_id} marked as approved (duplicate key)")
+            else:
+                logger.error(f"❌ Failed to create key for auto-approve order #{order_id}")
+                # Notify admin about failure
+                try:
+                    bot.send_message(
+                        ADMIN_CHAT_ID,
+                        f"⚠️ Auto-approve failed for order #{order_id}\n"
+                        f"User: {customer_id}\n"
+                        f"Error: {error_msg}\n"
+                        f"Please review manually."
+                    )
+                except:
+                    pass
                 
     except Exception as e:
         logger.error(f"Auto-approve error for order #{order_id}: {e}")
