@@ -1966,6 +1966,17 @@ def handle_photo(message):
         bot.reply_to(message, "❌ No active order found.")
         return
     
+    # Check if order is already processed (prevent duplicate submissions)
+    order = get_order(order_id)
+    if order and order[6] != 'pending':  # status column
+        user_sessions[user_id]['waiting_screenshot'] = False
+        bot.reply_to(message, 
+            f"✅ *Order #{order_id} အတွက် Key ရပြီးသားပါ!*\n\n"
+            "🔑 My Keys ကို နှိပ်ပြီး Key ကြည့်ပါ။",
+            reply_markup=main_menu_keyboard()
+        )
+        return
+    
     # Get photo file ID
     photo = message.photo[-1]  # Highest resolution
     file_id = photo.file_id
