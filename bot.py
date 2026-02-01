@@ -2642,39 +2642,15 @@ def cancel_auto_approve(order_id):
 
 
 def log_auto_approval(order_id, customer_id, ocr_amount, result):
-    """Log auto-approval for admin to review later"""
+    """Log auto-approval to security events only (no admin message)"""
     try:
-        log_entry = {
-            'timestamp': datetime.now().isoformat(),
-            'order_id': order_id,
-            'customer_id': customer_id,
-            'ocr_amount': ocr_amount,
-            'client_email': result.get('client_email'),
-            'client_id': result.get('client_id'),
-            'status': 'auto_approved'
-        }
-        
-        # Log to security events
+        # Log to security events for database record
         log_security_event(
             'AUTO_APPROVE',
-            f"Order #{order_id} auto-approved for user {customer_id}, amount: {ocr_amount} Ks"
+            f"Order #{order_id} auto-approved for user {customer_id}, amount: {ocr_amount} Ks, key: {result.get('client_email')}"
         )
-        
-        # Escape underscores for Markdown
-        safe_client_email = str(result.get('client_email', '')).replace('_', '\\_')
-        
-        # Also send to admin for later review
-        bot.send_message(
-            ADMIN_CHAT_ID,
-            f"📋 *Auto-Approved Order Log*\n\n"
-            f"🆔 Order: #{order_id}\n"
-            f"👤 User: {customer_id}\n"
-            f"💰 OCR Amount: {ocr_amount:,} Ks\n"
-            f"🔑 Key: {safe_client_email}\n"
-            f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-            f"_Admin နောက်မှ verify လုပ်ပါ။ မှားရင် Key disable လုပ်ပါ။_",
-            parse_mode='Markdown'
-        )
+        # Note: Payment Channel message is already updated in auto_approve_order()
+        # No need to send separate admin message
         
     except Exception as e:
         logger.error(f"Error logging auto-approval: {e}")
