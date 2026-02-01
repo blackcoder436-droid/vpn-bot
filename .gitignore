@@ -5,7 +5,7 @@
 
 .env.local
 .env.production
-#*.env
+*.env
 
 # Config with hardcoded credentials (use secure_config.py instead)
 # config.py  # Uncomment this if you migrate to secure_config.py
