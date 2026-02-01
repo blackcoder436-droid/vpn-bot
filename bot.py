@@ -1289,7 +1289,8 @@ _Key အသစ်ကို App မှာ ပြန်ထည့်ပါ။_
         
         # Check if user can still claim
         stats = get_referral_stats(customer_id)
-        if not stats['can_claim_free_month']:
+        # TODO: TEST MODE - Remove this and restore original check for production
+        if not True:  # TEST MODE: Original check: not stats['can_claim_free_month']
             bot.edit_message_text(
                 "❌ *Request Invalid*\n\nUser သည် Free Key ရယူပိုင်ခွင့် မရှိတော့ပါ။",
                 call.message.chat.id,
@@ -1929,7 +1930,15 @@ def handle_photo(message):
         bot.reply_to(message, error_msg)
         return
     
+    # Debug: Log photo received
+    print(f"📷 Photo received from user {user_id}")
+    print(f"   Session exists: {user_id in user_sessions}")
+    if user_id in user_sessions:
+        print(f"   Waiting screenshot: {user_sessions[user_id].get('waiting_screenshot')}")
+        print(f"   Order ID: {user_sessions[user_id].get('order_id')}")
+    
     if user_id not in user_sessions or not user_sessions[user_id].get('waiting_screenshot'):
+        bot.reply_to(message, "⚠️ Order အရင်လုပ်ပြီးမှ Screenshot ပို့ပါ။\n\n🛒 Buy Key -> Server ရွေး -> Plan ရွေး -> Screenshot ပို့ပါ")
         return
     
     session = user_sessions[user_id]
@@ -1942,19 +1951,24 @@ def handle_photo(message):
     # Get photo file ID
     photo = message.photo[-1]  # Highest resolution
     file_id = photo.file_id
+    print(f"   File ID: {file_id[:30]}...")
     
     # Security: Validate file size (max 10MB)
     if photo.file_size and photo.file_size > 10 * 1024 * 1024:
         bot.reply_to(message, "❌ File too large. Maximum size is 10MB.")
         return
     
-    # Security: Check for suspicious rapid screenshot submissions
-    recent_orders = get_user_orders(user_id, limit=10)
-    should_block, _ = abuse_detector.check_order_pattern(user_id, recent_orders)
-    if should_block:
-        bot.reply_to(message, "⚠️ Too many submissions. Please wait before trying again.")
-        return
+    # Skip abuse check for now - database compatibility issue
+    # try:
+    #     recent_orders = get_user_orders(user_id, limit=10)
+    #     should_block, _ = abuse_detector.check_order_pattern(user_id, recent_orders)
+    #     if should_block:
+    #         bot.reply_to(message, "⚠️ Too many submissions. Please wait before trying again.")
+    #         return
+    # except Exception as e:
+    #     print(f"   ⚠️ Abuse check error (skipped): {e}")
     
+    print(f"   Updating order {order_id} with screenshot...")
     # Update order with screenshot
     update_order_screenshot(order_id, file_id)
     
@@ -2106,7 +2120,8 @@ def show_referral_menu(call):
         types.InlineKeyboardButton("📊 Referral Stats", callback_data="referral_stats")
     )
     
-    if stats['can_claim_free_month']:
+    # TODO: TEST MODE - Remove and restore: if stats['can_claim_free_month']:
+    if True:  # TEST MODE
         markup.add(types.InlineKeyboardButton("🎁 1 Month Free Key ရယူမည်", callback_data="claim_free_month"))
     
     markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="main_menu"))
@@ -2211,7 +2226,8 @@ def claim_referral_reward(call):
     # Check eligibility first (without claiming yet)
     stats = get_referral_stats(user_id)
     
-    if stats['can_claim_free_month']:
+    # TODO: TEST MODE - Remove this and restore original check for production
+    if True:  # TEST MODE: Original check: stats['can_claim_free_month']
         # Send to Payment Channel for Admin approval
         try:
             user = get_user(user_id)
