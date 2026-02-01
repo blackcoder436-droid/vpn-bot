@@ -574,6 +574,7 @@ class SecurityLogger:
 VALID_CALLBACK_PREFIXES = [
     'main_menu',
     'free_test',
+    'free_test_verify',  # Channel membership verification
     'free_server_',
     'free_proto_',
     'buy_key',

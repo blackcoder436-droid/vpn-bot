@@ -44,6 +44,10 @@ except ImportError as e:
     OCR_ENABLED = False
     print(f"⚠️ OCR Payment Verification disabled: {e}")
 
+# Channel that users must join for Free Test Key
+REQUIRED_CHANNEL_ID = "@BurmeseDigitalStore"  # Channel username (with @)
+REQUIRED_CHANNEL_LINK = "https://t.me/BurmeseDigitalStore"
+
 # Auto-approve settings
 AUTO_APPROVE_ENABLED = True  # Enable/disable auto-approve
 AUTO_APPROVE_TIMEOUT = 60  # 1 minute - faster approval for users
@@ -194,6 +198,20 @@ def sanitize_username(username: str) -> str:
     # Remove potentially dangerous characters
     safe_username = re.sub(r'[<>"\']', '', username)
     return safe_username[:50]  # Limit length
+
+# Channel that users must join for Free Test Key
+REQUIRED_CHANNEL_ID = "@BurmeseDigitalStore"  # Channel username (with @)
+REQUIRED_CHANNEL_LINK = "https://t.me/BurmeseDigitalStore"
+
+def check_channel_membership(user_id):
+    """Check if user is a member of the required channel"""
+    try:
+        member = bot.get_chat_member(REQUIRED_CHANNEL_ID, user_id)
+        # User is a member if status is creator, administrator, member, or restricted
+        return member.status in ['creator', 'administrator', 'member', 'restricted']
+    except Exception as e:
+        logger.warning(f"Failed to check channel membership for {user_id}: {e}")
+        return False
 
 # ===================== KEYBOARDS =====================
 
@@ -680,6 +698,26 @@ def button_callback(call):
             )
             return
         
+        # Check if user has joined the required channel
+        if not check_channel_membership(user_id):
+            markup = types.InlineKeyboardMarkup(row_width=1)
+            markup.add(
+                types.InlineKeyboardButton("📢 Channel Join မည်", url=REQUIRED_CHANNEL_LINK),
+                types.InlineKeyboardButton("✅ Join ပြီးပါပြီ", callback_data="free_test_verify")
+            )
+            markup.add(types.InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu"))
+            bot.edit_message_text(
+                "📢 *Free Test Key ရယူရန်*\n\n"
+                "Free Test Key ရရှိရန် အောက်ပါ Channel ကို အရင်ဦးဆုံး Join ပါ:\n\n"
+                f"👉 {REQUIRED_CHANNEL_LINK}\n\n"
+                "Join ပြီးပါက *'✅ Join ပြီးပါပြီ'* ကို နှိပ်ပါ။",
+                call.message.chat.id,
+                call.message.message_id,
+                parse_mode='Markdown',
+                reply_markup=markup
+            )
+            return
+        
         if has_used_free_test(user_id):
             bot.edit_message_text(
                 MESSAGES['free_key_limit'],
@@ -692,6 +730,55 @@ def button_callback(call):
                 "🖥️ *Free Test Key အတွက် Server ရွေးပါ:*",
                 call.message.chat.id,
                 call.message.message_id,
+                reply_markup=server_keyboard(for_free=True)
+            )
+    
+    # Free test key verification after channel join
+    elif data == "free_test_verify":
+        # Re-check channel membership
+        if not check_channel_membership(user_id):
+            markup = types.InlineKeyboardMarkup(row_width=1)
+            markup.add(
+                types.InlineKeyboardButton("📢 Channel Join မည်", url=REQUIRED_CHANNEL_LINK),
+                types.InlineKeyboardButton("✅ Join ပြီးပါပြီ", callback_data="free_test_verify")
+            )
+            markup.add(types.InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu"))
+            bot.edit_message_text(
+                "❌ *Channel Join မလုပ်ရသေးပါ!*\n\n"
+                "Free Test Key ရရှိရန် အောက်ပါ Channel ကို Join ပါ:\n\n"
+                f"👉 {REQUIRED_CHANNEL_LINK}\n\n"
+                "Join ပြီးပါက *'✅ Join ပြီးပါပြီ'* ကို ပြန်နှိပ်ပါ။",
+                call.message.chat.id,
+                call.message.message_id,
+                parse_mode='Markdown',
+                reply_markup=markup
+            )
+            return
+        
+        # Check if feature is enabled
+        if not feature_flags.get('free_test_key', True):
+            bot.edit_message_text(
+                "🚫 *Free Test Key ယယက္ခံ ပိတ်ထားပါသည်။*\n\nကျေးဇူးပြု၍ VPN Key ဝယ်ယူပါ။",
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=main_menu_keyboard()
+            )
+            return
+        
+        # User has joined - proceed to server selection
+        if has_used_free_test(user_id):
+            bot.edit_message_text(
+                MESSAGES['free_key_limit'],
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=main_menu_keyboard()
+            )
+        else:
+            bot.edit_message_text(
+                "✅ *Channel Join အတည်ပြုပြီးပါပြီ!*\n\n🖥️ *Free Test Key အတွက် Server ရွေးပါ:*",
+                call.message.chat.id,
+                call.message.message_id,
+                parse_mode='Markdown',
                 reply_markup=server_keyboard(for_free=True)
             )
     
@@ -1493,8 +1580,7 @@ _Key အသစ်ကို App မှာ ပြန်ထည့်ပါ။_
         
         # Check if user can still claim
         stats = get_referral_stats(customer_id)
-        # TODO: TEST MODE - Remove this and restore original check for production
-        if not True:  # TEST MODE: Original check: not stats['can_claim_free_month']
+        if not stats['can_claim_free_month']:
             bot.edit_message_text(
                 "❌ *Request Invalid*\n\nUser သည် Free Key ရယူပိုင်ခွင့် မရှိတော့ပါ။",
                 call.message.chat.id,
@@ -3057,8 +3143,8 @@ def show_referral_menu(call):
         types.InlineKeyboardButton("📊 Referral Stats", callback_data="referral_stats")
     )
     
-    # TODO: TEST MODE - Remove and restore: if stats['can_claim_free_month']:
-    if True:  # TEST MODE
+    # Only show claim button when user has 3 paid referrals
+    if stats['can_claim_free_month']:
         markup.add(types.InlineKeyboardButton("🎁 1 Month Free Key ရယူမည်", callback_data="claim_free_month"))
     
     markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="main_menu"))
@@ -3087,18 +3173,18 @@ Link:
 `{ref_link}`
 
 📋 *အသုံးပြုနည်း:*
-1️⃣ Link ကို Copy ကူးပါ
-2️⃣ သူငယ်ချင်းတွေကို Share ပါ
-3️⃣ သူတို့ Key ဝယ်ရင် သင် Bonus ရပါမယ်
+1️⃣ Link ကို Copy ကူးပါ။
+2️⃣ သူငယ်ချင်းတွေကို Share ပါ။
+3️⃣ သူတို့ Key ဝယ်ရင် သင် Bonus ရပါမယ်။
 
 🎁 *Rewards:*
 • 1 ယောက်ဝယ်ရင် = +5 Days (Key သက်တမ်းတိုး)
 • 3 ယောက်ဝယ်ရင် = 1 Month Free Key
 
 📝 *မှတ်ချက်:*
-• User ID အသုံးပြုထားသောကြောင့် Username ပြောင်းလဲလို့မရပါ
-• Self-referral လုပ်လို့မရပါ
-• တစ်ယောက်ကို တစ်ခါသာ Refer လုပ်လို့ရပါ
+• Fake Referral များ ခွင့်မပြုပါ။
+• Self-referral လုပ်လို့မရပါ။
+• တစ်ယောက်ကို တစ်ခါသာ Refer လုပ်လို့ရပါသည်။
 """
     
     markup = types.InlineKeyboardMarkup()
@@ -3163,8 +3249,8 @@ def claim_referral_reward(call):
     # Check eligibility first (without claiming yet)
     stats = get_referral_stats(user_id)
     
-    # TODO: TEST MODE - Remove this and restore original check for production
-    if True:  # TEST MODE: Original check: stats['can_claim_free_month']
+    # Only proceed if user has 3 paid referrals
+    if stats['can_claim_free_month']:
         # Send to Payment Channel for Admin approval
         try:
             user = get_user(user_id)
