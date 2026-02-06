@@ -1208,7 +1208,9 @@ def button_callback(call):
                     # Generate config link based on protocol
                     if protocol == 'trojan':
                         client_uuid = client.get('password')
-                        config_link = f"trojan://{client_uuid}@{server_domain}:{port}?security=none&type=tcp#{client.get('email')}"
+                        # Use custom trojan_port if configured, otherwise use inbound port
+                        trojan_port = SERVERS.get(server_id, {}).get('trojan_port', port)
+                        config_link = f"trojan://{client_uuid}@{server_domain}:{trojan_port}?security=none&type=tcp#{client.get('email')}"
                     elif protocol == 'vless':
                         client_uuid = client.get('id')
                         config_link = f"vless://{client_uuid}@{server_domain}:{port}?type=tcp&security=none#{client.get('email')}"

@@ -255,7 +255,9 @@ class XUIApi:
                 encoded_remark = urllib.parse.quote(f"{remark}-{client_name}-{expiry_days_left}")
                 
                 if inbound_protocol == 'trojan':
-                    config_link = f"trojan://{client_uuid}@{self.server['domain']}:{port}?security=none&type=tcp#{encoded_remark}"
+                    # Use custom trojan_port if configured, otherwise use inbound port
+                    trojan_port = self.server.get('trojan_port', port)
+                    config_link = f"trojan://{client_uuid}@{self.server['domain']}:{trojan_port}?security=none&type=tcp#{encoded_remark}"
                 elif inbound_protocol == 'vless':
                     config_link = f"vless://{client_uuid}@{self.server['domain']}:{port}?type=tcp&security=none#{encoded_remark}"
                 elif inbound_protocol == 'vmess':

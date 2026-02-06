@@ -46,7 +46,8 @@ SERVERS = {
         "panel_path": "/mka",
         "domain": "jan.burmesedigital.store",
         "sub_port": 2096,
-        "panel_type": "xui"  # xui or hiddify
+        "panel_type": "xui",  # xui or hiddify
+        "trojan_port": 22716  # Custom port for Trojan protocol
     },
     "sg2": {
         "name": "🇸🇬 Singapore 2", 
