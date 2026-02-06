@@ -65,6 +65,14 @@ SERVERS = {
         "sub_port": 2096,
         "panel_type": "xui"
     },
+    "us1": {
+        "name": "🇺🇸 US United States 1",
+        "url": "https://us.burmesedigital.store:8080",
+        "panel_path": "/mka",
+        "domain": "us.burmesedigital.store",
+        "sub_port": 8080,
+        "panel_type": "xui"
+    },
     "hiddify1": {
         "name": "🌐 Hiddify Key",
         "url": "https://main.burmesedigital.store",
