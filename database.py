@@ -197,6 +197,31 @@ def init_db():
         )
     ''')
 
+    # Protocol settings table (admin can enable/disable protocols)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS protocol_settings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            protocol_name TEXT UNIQUE NOT NULL,
+            display_name TEXT NOT NULL,
+            is_enabled INTEGER DEFAULT 1,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_by INTEGER
+        )
+    ''')
+    
+    # Initialize default protocols
+    default_protocols = [
+        ('trojan', '🔐 Trojan (Recommended)', 1),
+        ('vless', '⚡ VLESS', 1),
+        ('vmess', '🌐 VMess', 1),
+        ('shadowsocks', '🔒 Shadowsocks', 1),
+        ('wireguard', '🛡️ WireGuard', 1)
+    ]
+    for proto_name, display_name, is_enabled in default_protocols:
+        cursor.execute('''
+            INSERT OR IGNORE INTO protocol_settings (protocol_name, display_name, is_enabled) VALUES (?, ?, ?)
+        ''', (proto_name, display_name, is_enabled))
+
     conn.commit()
     conn.close()
     print("✅ Database initialized successfully!")
@@ -883,6 +908,56 @@ def get_all_feature_flags():
     results = cursor.fetchall()
     conn.close()
     return {row[0]: bool(row[1]) for row in results}
+
+# ==================== PROTOCOL SETTINGS ====================
+
+def get_protocol_enabled(protocol_name):
+    """Check if a protocol is enabled"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    cursor.execute('SELECT is_enabled FROM protocol_settings WHERE protocol_name = ?', (protocol_name,))
+    result = cursor.fetchone()
+    conn.close()
+    return bool(result[0]) if result else True  # Default to True if not found
+
+def set_protocol_enabled(protocol_name, is_enabled, updated_by=None):
+    """Set protocol enabled/disabled status"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    try:
+        cursor.execute('''
+            INSERT INTO protocol_settings (protocol_name, display_name, is_enabled, updated_at, updated_by)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?)
+            ON CONFLICT(protocol_name) DO UPDATE SET 
+                is_enabled = excluded.is_enabled,
+                updated_at = CURRENT_TIMESTAMP,
+                updated_by = excluded.updated_by
+        ''', (protocol_name, protocol_name.upper(), 1 if is_enabled else 0, updated_by))
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"Error setting protocol status: {e}")
+        return False
+    finally:
+        conn.close()
+
+def get_all_protocol_settings():
+    """Get all protocol settings from database"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    cursor.execute('SELECT protocol_name, display_name, is_enabled FROM protocol_settings')
+    results = cursor.fetchall()
+    conn.close()
+    return {row[0]: {'display_name': row[1], 'is_enabled': bool(row[2])} for row in results}
+
+def get_enabled_protocols():
+    """Get list of enabled protocol names"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    cursor.execute('SELECT protocol_name FROM protocol_settings WHERE is_enabled = 1')
+    results = cursor.fetchall()
+    conn.close()
+    return [row[0] for row in results]
 
 # ==================== USER BAN SYSTEM ====================
 

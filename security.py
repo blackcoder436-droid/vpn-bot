@@ -608,6 +608,7 @@ VALID_CALLBACK_PREFIXES = [
     'reject_',
     'toggle_server_',
     'toggle_feature_',
+    'toggle_protocol_',
     # Statistics callbacks
     'stats_',
     # Ban management callbacks

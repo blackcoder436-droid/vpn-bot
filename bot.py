@@ -21,6 +21,8 @@ from database import (
     get_user_active_keys, extend_key_expiry, get_referred_users_details,
     # Feature flags
     get_feature_flag, set_feature_flag, get_all_feature_flags,
+    # Protocol settings
+    get_protocol_enabled, set_protocol_enabled, get_all_protocol_settings, get_enabled_protocols,
     # User ban system
     ban_user, unban_user, is_user_banned as is_user_banned_db, 
     get_banned_users, get_user_ban_history,
@@ -295,7 +297,7 @@ def month_keyboard(server_id, device_count):
     return markup
 
 def protocol_keyboard(server_id, is_free=False):
-    """Protocol selection keyboard - Trojan first as default"""
+    """Protocol selection keyboard - Trojan first as default, only shows enabled protocols"""
     markup = types.InlineKeyboardMarkup(row_width=1)
     
     # Get available protocols from server
@@ -306,6 +308,22 @@ def protocol_keyboard(server_id, is_free=False):
     except Exception as e:
         logger.error(f"Error getting protocols: {e}")
         available = ['trojan']  # Default fallback
+    
+    # Get enabled protocols from database (admin settings)
+    try:
+        enabled_protocols = get_enabled_protocols()
+        if not enabled_protocols:
+            enabled_protocols = ['trojan', 'vless', 'vmess', 'shadowsocks', 'wireguard']  # Default all enabled
+    except Exception as e:
+        logger.error(f"Error getting enabled protocols: {e}")
+        enabled_protocols = ['trojan', 'vless', 'vmess', 'shadowsocks', 'wireguard']
+    
+    # Filter available protocols by enabled status
+    available = [proto for proto in available if proto in enabled_protocols]
+    
+    # Ensure at least one protocol is available
+    if not available:
+        available = ['trojan']  # Fallback to trojan
     
     prefix = "free_proto" if is_free else "proto"
     
@@ -349,13 +367,14 @@ def admin_menu_keyboard():
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(
         types.InlineKeyboardButton("📊 Sales Report", callback_data="admin_sales"),
-        types.InlineKeyboardButton("� Statistics", callback_data="admin_stats"),
+        types.InlineKeyboardButton("📈 Statistics", callback_data="admin_stats"),
         types.InlineKeyboardButton("📋 Pending Orders", callback_data="admin_pending"),
         types.InlineKeyboardButton("👥 All Users", callback_data="admin_users"),
         types.InlineKeyboardButton("🚫 Ban Management", callback_data="admin_bans"),
         types.InlineKeyboardButton("🔔 Send Broadcast", callback_data="admin_broadcast"),
         types.InlineKeyboardButton("🖥️ Server Management", callback_data="admin_servers"),
         types.InlineKeyboardButton("⚙️ Feature Management", callback_data="admin_features"),
+        types.InlineKeyboardButton("🔒 Protocol Management", callback_data="admin_protocols"),
         types.InlineKeyboardButton("📦 Manual Backup", callback_data="admin_backup")
     )
     return markup
@@ -420,6 +439,37 @@ def feature_management_keyboard():
         markup.add(types.InlineKeyboardButton(
             f"{feature_name} - {status}",
             callback_data=f"toggle_feature_{feature_id}"
+        ))
+    
+    markup.add(types.InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_back"))
+    return markup
+
+def protocol_management_keyboard():
+    """Protocol management keyboard for admin - enable/disable protocols"""
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    
+    # Get all protocol settings from database
+    protocol_settings = get_all_protocol_settings()
+    
+    # Default protocols if database is empty
+    default_protocols = [
+        ('trojan', '🔐 Trojan'),
+        ('vless', '⚡ VLESS'),
+        ('vmess', '🌐 VMess'),
+        ('shadowsocks', '🔒 Shadowsocks'),
+        ('wireguard', '🛡️ WireGuard')
+    ]
+    
+    for proto_id, proto_name in default_protocols:
+        if proto_id in protocol_settings:
+            is_enabled = protocol_settings[proto_id]['is_enabled']
+        else:
+            is_enabled = True  # Default enabled
+        
+        status = "🟢 ON" if is_enabled else "🔴 OFF"
+        markup.add(types.InlineKeyboardButton(
+            f"{proto_name} - {status}",
+            callback_data=f"toggle_protocol_{proto_id}"
         ))
     
     markup.add(types.InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_back"))
@@ -2342,6 +2392,107 @@ _App မှာ Subscription Link ထည့်ပြီး အသုံးပြ�
             call.message.chat.id,
             call.message.message_id,
             reply_markup=feature_management_keyboard()
+        )
+    
+    # ==================== PROTOCOL MANAGEMENT ====================
+    elif data == "admin_protocols":
+        if user_id != ADMIN_CHAT_ID:
+            return
+        
+        text = "🔒 *Protocol Management*\n\n"
+        text += "Protocol တွေကို Enable/Disable လုပ်နိုင်ပါတယ်။\n"
+        text += "Disable လုပ်ထားတဲ့ Protocol တွေကို User တွေ ရွေးလို့ရမည်မဟုတ်ပါ။\n\n"
+        
+        protocol_names = {
+            'trojan': '🔐 Trojan',
+            'vless': '⚡ VLESS',
+            'vmess': '🌐 VMess',
+            'shadowsocks': '🔒 Shadowsocks',
+            'wireguard': '🛡️ WireGuard'
+        }
+        
+        protocol_settings = get_all_protocol_settings()
+        
+        for proto_id, proto_name in protocol_names.items():
+            if proto_id in protocol_settings:
+                is_enabled = protocol_settings[proto_id]['is_enabled']
+            else:
+                is_enabled = True
+            status = "🟢 ON" if is_enabled else "🔴 OFF"
+            text += f"• {proto_name} - {status}\n"
+        
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=protocol_management_keyboard()
+        )
+    
+    elif data.startswith("toggle_protocol_"):
+        if user_id != ADMIN_CHAT_ID:
+            return
+        
+        protocol_id = data.replace("toggle_protocol_", "")
+        
+        protocol_names = {
+            'trojan': 'Trojan',
+            'vless': 'VLESS',
+            'vmess': 'VMess',
+            'shadowsocks': 'Shadowsocks',
+            'wireguard': 'WireGuard'
+        }
+        
+        if protocol_id not in protocol_names:
+            bot.answer_callback_query(call.id, "❌ Unknown protocol", show_alert=True)
+            return
+        
+        # Get current status
+        protocol_settings = get_all_protocol_settings()
+        current_status = protocol_settings.get(protocol_id, {}).get('is_enabled', True)
+        new_status = not current_status
+        
+        # Don't allow disabling all protocols - at least one must be enabled
+        enabled_count = sum(1 for p in protocol_settings.values() if p.get('is_enabled', True))
+        if not new_status and enabled_count <= 1:
+            bot.answer_callback_query(call.id, "⚠️ အနည်းဆုံး Protocol တစ်ခု Enable ထားရမည်!", show_alert=True)
+            return
+        
+        # Toggle protocol
+        set_protocol_enabled(protocol_id, new_status, updated_by=user_id)
+        action = "✅ Enabled" if new_status else "🔴 Disabled"
+        
+        protocol_name = protocol_names.get(protocol_id, protocol_id)
+        bot.answer_callback_query(call.id, f"{action}: {protocol_name}", show_alert=True)
+        
+        # Refresh protocol management page
+        text = "🔒 *Protocol Management*\n\n"
+        text += "Protocol တွေကို Enable/Disable လုပ်နိုင်ပါတယ်။\n"
+        text += "Disable လုပ်ထားတဲ့ Protocol တွေကို User တွေ ရွေးလို့ရမည်မဟုတ်ပါ။\n\n"
+        
+        protocol_display = {
+            'trojan': '🔐 Trojan',
+            'vless': '⚡ VLESS',
+            'vmess': '🌐 VMess',
+            'shadowsocks': '🔒 Shadowsocks',
+            'wireguard': '🛡️ WireGuard'
+        }
+        
+        # Refresh protocol settings
+        protocol_settings = get_all_protocol_settings()
+        
+        for proto_id, proto_name in protocol_display.items():
+            if proto_id in protocol_settings:
+                is_enabled = protocol_settings[proto_id]['is_enabled']
+            else:
+                is_enabled = True
+            status = "🟢 ON" if is_enabled else "🔴 OFF"
+            text += f"• {proto_name} - {status}\n"
+        
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=protocol_management_keyboard()
         )
     
     # ==================== STATISTICS ====================
