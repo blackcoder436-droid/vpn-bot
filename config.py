@@ -24,10 +24,6 @@ PAYMENT_CHANNEL_ID = int(os.environ.get('PAYMENT_CHANNEL_ID', '0'))
 XUI_USERNAME = os.environ.get('XUI_USERNAME', '')
 XUI_PASSWORD = os.environ.get('XUI_PASSWORD', '')
 
-# Hiddify Panel Credentials (from environment variables)
-HIDDIFY_API_KEY = os.environ.get('HIDDIFY_API_KEY', '')
-HIDDIFY_ADMIN_UUID = os.environ.get('HIDDIFY_ADMIN_UUID', '')
-
 # Validate required credentials
 if not BOT_TOKEN:
     raise ValueError("❌ BOT_TOKEN is required! Set it in .env file.")
@@ -35,8 +31,6 @@ if not ADMIN_CHAT_ID:
     raise ValueError("❌ ADMIN_CHAT_ID is required! Set it in .env file.")
 if not XUI_USERNAME or not XUI_PASSWORD:
     print("⚠️ Warning: XUI credentials not set. XUI panel features will be disabled.")
-if not HIDDIFY_API_KEY:
-    print("⚠️ Warning: Hiddify API key not set. Hiddify panel features will be disabled.")
 
 # Server List
 SERVERS = {
@@ -46,7 +40,7 @@ SERVERS = {
         "panel_path": "/mka",
         "domain": "jan.burmesedigital.store",
         "sub_port": 2096,
-        "panel_type": "xui",  # xui or hiddify
+        "panel_type": "xui",
         "trojan_port": 22716  # Custom port for Trojan protocol
     },
     "sg2": {
@@ -73,17 +67,6 @@ SERVERS = {
         "sub_port": 8080,
         "panel_type": "xui"
     },
-    "hiddify1": {
-        "name": "🌐 Hiddify Key",
-        "url": "https://main.burmesedigital.store",
-        "panel_path": "SeS1TFUTYLdZXv7F",  # Admin panel path (for API)
-        "domain": "main.burmesedigital.store",
-        "panel_type": "hiddify",
-        "api_key": HIDDIFY_API_KEY if HIDDIFY_API_KEY else "c0ac46c4-7da2-44cd-89e8-be68e24ba01b",
-        "admin_uuid": HIDDIFY_ADMIN_UUID if HIDDIFY_ADMIN_UUID else "c0ac46c4-7da2-44cd-89e8-be68e24ba01b",
-        "proxy_path": "SeS1TFUTYLdZXv7F",  # Admin proxy path (for API)
-        "user_sub_path": "JFpw0BGULh0DRp"  # User subscription path (for client apps)
-    }
 }
 
 # VPN Plans - Format: {devices}dev_{months}month

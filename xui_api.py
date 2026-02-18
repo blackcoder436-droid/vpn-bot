@@ -3,18 +3,43 @@ import json
 import uuid
 import random
 import string
+import logging
 from datetime import datetime, timedelta
-from config import SERVERS, XUI_USERNAME, XUI_PASSWORD
+from config import SERVERS as CONFIG_SERVERS, XUI_USERNAME, XUI_PASSWORD
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+logger = logging.getLogger(__name__)
 
 # Disable SSL warnings
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# Server down alert callback (set by bot.py)
+_server_alert_callback = None
+
+def set_server_alert_callback(callback):
+    """Set callback for server down alerts. Callback: fn(server_name, error_msg)"""
+    global _server_alert_callback
+    _server_alert_callback = callback
+
+def _get_server(server_id):
+    """Get server config - checks bot's dynamic SERVERS first, then config"""
+    try:
+        from bot import SERVERS as BOT_SERVERS
+        server = BOT_SERVERS.get(server_id)
+        if server:
+            return server
+    except ImportError:
+        pass
+    return CONFIG_SERVERS.get(server_id)
+
+
 class XUIApi:
     def __init__(self, server_id):
-        self.server = SERVERS[server_id]
+        self.server = _get_server(server_id)
+        if not self.server:
+            raise ValueError(f"Server {server_id} not found")
         self.base_url = self.server['url'] + self.server['panel_path']
         self.session = requests.Session()
         self.session.verify = False
@@ -44,19 +69,28 @@ class XUIApi:
             
             if result.get('success'):
                 self.logged_in = True
-                print(f"✅ Logged in to {self.server['name']}")
+                logger.info(f"✅ Logged in to {self.server['name']}")
                 return True
             else:
-                print(f"❌ Login failed: {result.get('msg')}")
+                logger.error(f"❌ Login failed for {self.server['name']}: {result.get('msg')}")
                 return False
         except requests.exceptions.SSLError as e:
-            print(f"⚠️ SSL Error for {self.server['name']}: Server may be temporarily unavailable")
+            error_msg = f"SSL Error: Server may be temporarily unavailable"
+            logger.error(f"⚠️ {error_msg} - {self.server['name']}")
+            if _server_alert_callback:
+                _server_alert_callback(self.server['name'], error_msg)
             return False
         except requests.exceptions.ConnectionError as e:
-            print(f"⚠️ Connection Error for {self.server['name']}: Server may be offline")
+            error_msg = f"Connection Error: Server may be offline"
+            logger.error(f"⚠️ {error_msg} - {self.server['name']}")
+            if _server_alert_callback:
+                _server_alert_callback(self.server['name'], error_msg)
             return False
         except Exception as e:
-            print(f"❌ Login error for {self.server['name']}: {e}")
+            error_msg = f"Login error: {e}"
+            logger.error(f"❌ {error_msg} - {self.server['name']}")
+            if _server_alert_callback:
+                _server_alert_callback(self.server['name'], error_msg)
             return False
     
     def get_inbounds(self):
@@ -73,7 +107,7 @@ class XUIApi:
                 return result.get('obj', [])
             return []
         except Exception as e:
-            print(f"❌ Error getting inbounds: {e}")
+            logger.error(f"❌ Error getting inbounds: {e}")
             return []
     
     def get_inbound_by_protocol(self, protocol='trojan'):
@@ -116,7 +150,7 @@ class XUIApi:
                 # Fallback to first available inbound
                 inbounds = self.get_inbounds()
                 if not inbounds:
-                    print("❌ No inbounds found")
+                    logger.error("❌ No inbounds found")
                     return None
                 inbound = inbounds[0]
                 protocol = inbound.get('protocol', 'trojan')
@@ -228,12 +262,12 @@ class XUIApi:
                 "settings": json.dumps({"clients": [client_settings]})
             }
             
-            print(f"📡 Creating client: {client_name} with protocol: {inbound_protocol}")
+            logger.info(f"📡 Creating client: {client_name} with protocol: {inbound_protocol}")
             response = self.session.post(url, data=payload)
             result = response.json()
             
             if result.get('success'):
-                print(f"✅ Client created: {client_name}")
+                logger.info(f"✅ Client created: {client_name}")
                 
                 # Generate subscription link
                 sub_link = f"https://{self.server['domain']}:{self.server['sub_port']}/sub/{sub_id}"
@@ -293,16 +327,16 @@ class XUIApi:
                     'config_link': config_link,
                     'sub_id': sub_id,
                     'protocol': inbound_protocol,
-                    'expiry_date': datetime.now() + timedelta(days=expiry_days),
+                    'expiry_date': expiry_datetime,
                     'data_limit': data_limit_gb,
                     'devices': devices
                 }
             else:
-                print(f"❌ Failed to create client: {result.get('msg')}")
+                logger.error(f"❌ Failed to create client: {result.get('msg')}")
                 return None
                 
         except Exception as e:
-            print(f"❌ Error creating client: {e}")
+            logger.error(f"❌ Error creating client: {e}")
             import traceback
             traceback.print_exc()
             return None
@@ -318,7 +352,7 @@ class XUIApi:
             result = response.json()
             return result.get('success', False)
         except Exception as e:
-            print(f"❌ Error deleting client: {e}")
+            logger.error(f"❌ Error deleting client: {e}")
             return False
     
     def get_client_stats(self, client_email):
@@ -335,7 +369,7 @@ class XUIApi:
                 return result.get('obj')
             return None
         except Exception as e:
-            print(f"❌ Error getting client stats: {e}")
+            logger.error(f"❌ Error getting client stats: {e}")
             return None
     
     def get_client_by_email(self, client_email):
@@ -363,7 +397,57 @@ class XUIApi:
             result = response.json()
             return result.get('success', False)
         except Exception as e:
-            print(f"❌ Error resetting traffic: {e}")
+            logger.error(f"❌ Error resetting traffic: {e}")
+            return False
+
+    def extend_client_expiry(self, client_email, extra_days):
+        """Extend client's expiry time by extra_days on the 3x-ui panel"""
+        if not self.logged_in:
+            self.login()
+        
+        try:
+            # Find the client and its inbound
+            client_data = self.get_client_by_email(client_email)
+            if not client_data:
+                logger.error(f"❌ Client {client_email} not found for expiry extension")
+                return False
+            
+            client = client_data['client']
+            inbound = client_data['inbound']
+            inbound_id = inbound['id']
+            
+            # Get current expiry
+            current_expiry_ms = client.get('expiryTime', 0)
+            if current_expiry_ms <= 0:
+                # No expiry set (unlimited) — skip
+                logger.warning(f"⚠️ Client {client_email} has no expiry (unlimited), skipping")
+                return True
+            
+            # Add extra days in milliseconds
+            extra_ms = extra_days * 24 * 60 * 60 * 1000
+            new_expiry_ms = current_expiry_ms + extra_ms
+            
+            # Update client settings
+            client['expiryTime'] = new_expiry_ms
+            
+            url = f"{self.base_url}/panel/api/inbounds/updateClient/{client.get('email')}"
+            payload = {
+                "id": inbound_id,
+                "settings": json.dumps({"clients": [client]})
+            }
+            
+            response = self.session.post(url, data=payload)
+            result = response.json()
+            
+            if result.get('success'):
+                new_dt = datetime.fromtimestamp(new_expiry_ms / 1000)
+                logger.info(f"✅ Extended {client_email} by {extra_days} days → {new_dt.strftime('%Y-%m-%d %H:%M')}")
+                return True
+            else:
+                logger.error(f"❌ Failed to extend client: {result.get('msg')}")
+                return False
+        except Exception as e:
+            logger.error(f"❌ Error extending client expiry: {e}")
             return False
 
 
@@ -399,7 +483,7 @@ def delete_vpn_client_xui(server_id, client_email):
     # Find the client first
     client_info = api.get_client_by_email(client_email)
     if not client_info:
-        print(f"⚠️ Client {client_email} not found, may already be deleted")
+        logger.warning(f"⚠️ Client {client_email} not found, may already be deleted")
         return True  # Consider it successful if not found
     
     inbound = client_info['inbound']
@@ -419,7 +503,7 @@ def delete_vpn_client_xui(server_id, client_email):
     if not client_uuid:
         client_uuid = client.get('email')
     
-    print(f"🗑️ Deleting client: {client_email} (UUID: {client_uuid}) from inbound {inbound_id}")
+    logger.info(f"🗑️ Deleting client: {client_email} (UUID: {client_uuid}) from inbound {inbound_id}")
     
     try:
         # Delete client from inbound - use UUID
@@ -430,7 +514,7 @@ def delete_vpn_client_xui(server_id, client_email):
         try:
             result = response.json()
         except:
-            print(f"⚠️ Non-JSON response: {response.text[:200]}")
+            logger.warning(f"⚠️ Non-JSON response: {response.text[:200]}")
             # Try alternative deletion method with email
             url2 = f"{api.base_url}/panel/api/inbounds/{inbound_id}/delClient/{client.get('email')}"
             response2 = api.session.post(url2)
@@ -440,13 +524,13 @@ def delete_vpn_client_xui(server_id, client_email):
                 return False
         
         if result.get('success'):
-            print(f"✅ Deleted client {client_email} from panel")
+            logger.info(f"✅ Deleted client {client_email} from panel")
             return True
         else:
-            print(f"❌ Failed to delete client: {result.get('msg')}")
+            logger.error(f"❌ Failed to delete client: {result.get('msg')}")
             return False
     except Exception as e:
-        print(f"❌ Error deleting client: {e}")
+        logger.error(f"❌ Error deleting client: {e}")
         return False
 
 
@@ -455,145 +539,126 @@ if __name__ == "__main__":
     api = XUIApi('sg1')
     if api.login():
         inbounds = api.get_inbounds()
-        print(f"Found {len(inbounds)} inbounds")
+        logger.debug(f"Found {len(inbounds)} inbounds")
         for ib in inbounds:
-            print(f"  - {ib.get('remark')} ({ib.get('protocol')})")
+            logger.debug(f"  - {ib.get('remark')} ({ib.get('protocol')})")
         
         protocols = api.get_available_protocols()
-        print(f"Available protocols: {protocols}")
+        logger.debug(f"Available protocols: {protocols}")
 
 
 # ===================== UNIFIED API =====================
-# Unified interface to support both XUI and Hiddify panels
+# Unified interface for XUI panel management
 
 def create_vpn_key(server_id, telegram_id, username, data_limit_gb=0, expiry_days=30, devices=1, protocol='trojan', key_number=1):
-    """Create VPN key - automatically detects panel type"""
-    from config import SERVERS
-    
-    server = SERVERS.get(server_id)
+    """Create VPN key on XUI panel"""
+    server = _get_server(server_id)
     if not server:
-        print(f"❌ Server {server_id} not found")
+        logger.error(f"❌ Server {server_id} not found")
         return None
     
-    panel_type = server.get('panel_type', 'xui')
-    print(f"📡 Creating VPN key on {server['name']} (panel_type: {panel_type})")
+    logger.info(f"📡 Creating VPN key on {server['name']}")
     
-    if panel_type == 'hiddify':
-        from hiddify_api import create_vpn_key_hiddify
-        return create_vpn_key_hiddify(server_id, telegram_id, username, data_limit_gb, expiry_days, devices, key_number)
-    else:
-        # Use XUI
-        api = XUIApi(server_id)
-        if not api.login():
-            print(f"❌ Failed to login to XUI panel")
-            return None
-        return api.create_client(telegram_id, username, data_limit_gb, expiry_days, devices, protocol, key_number=key_number)
+    api = XUIApi(server_id)
+    if not api.login():
+        logger.error(f"❌ Failed to login to XUI panel")
+        return None
+    return api.create_client(telegram_id, username, data_limit_gb, expiry_days, devices, protocol, key_number=key_number)
 
 
 def delete_vpn_client(server_id, client_id):
-    """Delete VPN client - automatically detects panel type"""
-    from config import SERVERS
-    
-    server = SERVERS.get(server_id)
+    """Delete VPN client from XUI panel"""
+    server = _get_server(server_id)
     if not server:
-        print(f"❌ Server {server_id} not found")
+        logger.error(f"❌ Server {server_id} not found")
         return False
     
-    panel_type = server.get('panel_type', 'xui')
+    api = XUIApi(server_id)
+    if not api.login():
+        return False
     
-    if panel_type == 'hiddify':
-        from hiddify_api import delete_vpn_user_hiddify
-        return delete_vpn_user_hiddify(server_id, client_id)
-    else:
-        # Use XUI - existing implementation
-        api = XUIApi(server_id)
-        if not api.login():
-            return False
+    inbounds = api.get_inbounds()
+    if not inbounds:
+        return False
+    
+    for inbound in inbounds:
+        settings = json.loads(inbound.get('settings', '{}'))
+        clients = settings.get('clients', [])
         
-        inbounds = api.get_inbounds()
-        if not inbounds:
-            return False
-        
-        for inbound in inbounds:
-            settings = json.loads(inbound.get('settings', '{}'))
-            clients = settings.get('clients', [])
-            
-            for client in clients:
-                client_uuid = client.get('id') or client.get('password')
-                if client_uuid == client_id or client.get('email') == client_id:
-                    inbound_id = inbound['id']
-                    client_email = client.get('email')
+        for client in clients:
+            client_uuid = client.get('id') or client.get('password')
+            if client_uuid == client_id or client.get('email') == client_id:
+                inbound_id = inbound['id']
+                client_email = client.get('email')
+                
+                try:
+                    url = f"{api.base_url}/panel/api/inbounds/{inbound_id}/delClient/{client_uuid}"
+                    response = api.session.post(url)
+                    result = response.json()
                     
-                    try:
-                        url = f"{api.base_url}/panel/api/inbounds/{inbound_id}/delClient/{client_uuid}"
-                        response = api.session.post(url)
-                        result = response.json()
-                        
-                        if result.get('success'):
-                            print(f"✅ Deleted client {client_email}")
-                            return True
-                    except Exception as e:
-                        print(f"❌ Error deleting client: {e}")
-        
-        return False
+                    if result.get('success'):
+                        logger.info(f"✅ Deleted client {client_email}")
+                        return True
+                except Exception as e:
+                    logger.error(f"❌ Error deleting client: {e}")
+    
+    return False
 
 
 def verify_client_exists(server_id, client_id):
-    """Verify if client exists and return client info - automatically detects panel type"""
-    from config import SERVERS
-    
-    server = SERVERS.get(server_id)
+    """Verify if client exists and return client info from XUI panel"""
+    server = _get_server(server_id)
     if not server:
         return False
     
-    panel_type = server.get('panel_type', 'xui')
-    
-    if panel_type == 'hiddify':
-        from hiddify_api import verify_user_exists_hiddify
-        return verify_user_exists_hiddify(server_id, client_id)
-    else:
-        # Use XUI - return client info dictionary
-        api = XUIApi(server_id)
-        if not api.login():
-            return False
-        
-        inbounds = api.get_inbounds()
-        if not inbounds:
-            return False
-        
-        for inbound in inbounds:
-            settings = json.loads(inbound.get('settings', '{}'))
-            clients = settings.get('clients', [])
-            
-            for client in clients:
-                client_uuid = client.get('id') or client.get('password')
-                if client_uuid == client_id or client.get('email') == client_id:
-                    # Return dictionary with client and inbound info
-                    return {
-                        'client': client,
-                        'inbound': inbound
-                    }
-        
+    api = XUIApi(server_id)
+    if not api.login():
         return False
+    
+    inbounds = api.get_inbounds()
+    if not inbounds:
+        return False
+    
+    for inbound in inbounds:
+        settings = json.loads(inbound.get('settings', '{}'))
+        clients = settings.get('clients', [])
+        
+        for client in clients:
+            client_uuid = client.get('id') or client.get('password')
+            if client_uuid == client_id or client.get('email') == client_id:
+                return {
+                    'client': client,
+                    'inbound': inbound
+                }
+    
+    return False
 
+
+# Protocol cache: {server_id: (protocols_list, timestamp)}
+_protocol_cache = {}
+_PROTOCOL_CACHE_TTL = 300  # 5 minutes
 
 def get_available_protocols(server_id):
-    """Get available protocols - automatically detects panel type"""
-    from config import SERVERS
+    """Get available protocols from XUI panel (cached for 5 min)"""
+    import time as _cache_time
     
-    server = SERVERS.get(server_id)
+    # Check cache
+    if server_id in _protocol_cache:
+        cached_protocols, cached_at = _protocol_cache[server_id]
+        if _cache_time.time() - cached_at < _PROTOCOL_CACHE_TTL:
+            return cached_protocols
+    
+    server = _get_server(server_id)
     if not server:
         return []
     
-    panel_type = server.get('panel_type', 'xui')
+    api = XUIApi(server_id)
+    if not api.login():
+        return []
     
-    if panel_type == 'hiddify':
-        from hiddify_api import get_available_protocols_hiddify
-        return get_available_protocols_hiddify(server_id)
-    else:
-        # Use XUI
-        api = XUIApi(server_id)
-        if not api.login():
-            return []
-        return api.get_available_protocols()
+    protocols = api.get_available_protocols()
+    
+    # Store in cache
+    _protocol_cache[server_id] = (protocols, _cache_time.time())
+    return protocols
 

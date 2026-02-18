@@ -619,10 +619,10 @@ VALID_CALLBACK_PREFIXES = [
     # Server management callbacks
     'add_server_start',
     'add_server_xui',
-    'add_server_hiddify',
     'delete_server_start',
     'confirm_delete_server_',
     'do_delete_server_',
+    'view_key_',
 ]
 
 def is_valid_callback(callback_data: str) -> bool:

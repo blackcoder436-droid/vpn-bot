@@ -75,13 +75,11 @@ def get_server_status():
     servers = []
     server_flags = {
         'sg1': '🇸🇬', 'sg2': '🇸🇬', 'sg3': '🇸🇬',
-        'us1': '🇺🇸',
-        'hiddify1': '🌐'
+        'us1': '🇺🇸'
     }
     server_names = {
         'sg1': 'Singapore 1', 'sg2': 'Singapore 2', 'sg3': 'Singapore 3',
-        'us1': 'United States',
-        'hiddify1': 'Hiddify Multi'
+        'us1': 'United States'
     }
     
     if SERVERS:
@@ -95,7 +93,7 @@ def get_server_status():
             })
     else:
         # Fallback server list
-        for sid in ['sg1', 'sg2', 'sg3', 'us1', 'hiddify1']:
+        for sid in ['sg1', 'sg2', 'sg3', 'us1']:
             servers.append({
                 'id': sid,
                 'name': server_names[sid],

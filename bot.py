@@ -11,7 +11,7 @@ import pytz  # For timezone support
 from config import BOT_TOKEN, ADMIN_CHAT_ID, PAYMENT_CHANNEL_ID, SERVERS as CONFIG_SERVERS, PLANS, PAYMENT_INFO, MESSAGES, DATABASE_PATH
 from database import (
     init_db, create_user, get_user, has_used_free_test, mark_free_test_used,
-    create_order, update_order_screenshot, approve_order, reject_order,
+    create_order, update_order_screenshot, approve_order, approve_order_atomic, reject_order,
     get_order, get_user_orders, save_vpn_key, get_user_keys, get_vpn_key_by_id, update_vpn_key,
     get_sales_stats, get_all_orders, get_expiring_keys, get_all_users,
     deactivate_vpn_key, log_security_event,
@@ -29,9 +29,15 @@ from database import (
     # Statistics
     get_statistics, get_revenue_by_period, get_top_users,
     # Server management
-    add_server, update_server, delete_server, get_server, get_all_db_servers, toggle_server_active
+    add_server, update_server, delete_server, get_server, get_all_db_servers, toggle_server_active,
+    # Free key stats
+    get_free_test_stats, get_free_key_conversions, get_free_key_server_stats,
+    # Screenshot duplicate detection
+    is_duplicate_screenshot, save_screenshot_unique_id,
+    # Stale order cleanup
+    cancel_stale_orders
 )
-from xui_api import create_vpn_key, get_available_protocols, delete_vpn_client, verify_client_exists
+from xui_api import create_vpn_key, get_available_protocols, delete_vpn_client, verify_client_exists, set_server_alert_callback
 from security import (
     rate_limiter, InputValidator, is_valid_callback, SecurityLogger,
     abuse_detector, VALID_CALLBACK_PREFIXES
@@ -52,7 +58,7 @@ REQUIRED_CHANNEL_LINK = "https://t.me/BurmeseDigitalStore"
 
 # Auto-approve settings
 AUTO_APPROVE_ENABLED = True  # Enable/disable auto-approve
-AUTO_APPROVE_TIMEOUT = 60  # 1 minute - faster approval for users
+AUTO_APPROVE_TIMEOUT = 100  # ~1.5 min - gives admin time to review before auto-approve
 pending_auto_approvals = {}  # {order_id: {'timer': timer, 'data': {...}}}
 
 # Protocol display names
@@ -74,8 +80,57 @@ logger = logging.getLogger(__name__)
 # Create bot instance
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode='Markdown')
 
-# User session storage
+# User session storage (with thread lock for safety)
+import time as _time
+_session_lock = threading.Lock()
 user_sessions = {}
+SESSION_TTL = 3600  # 1 hour - sessions older than this are cleaned up
+
+def cleanup_expired_sessions():
+    """Remove expired user sessions to prevent memory leaks"""
+    while True:
+        try:
+            _time.sleep(300)  # Run every 5 minutes
+            now = _time.time()
+            with _session_lock:
+                expired = [uid for uid, sess in user_sessions.items() 
+                          if now - sess.get('_created_at', 0) > SESSION_TTL]
+                for uid in expired:
+                    del user_sessions[uid]
+                if expired:
+                    logger.info(f"🧹 Cleaned {len(expired)} expired sessions")
+        except Exception as e:
+            logger.error(f"Session cleanup error: {e}")
+
+def set_session(user_id, data):
+    """Thread-safe session setter"""
+    with _session_lock:
+        existing = user_sessions.get(user_id, {})
+        existing.update(data)
+        existing['_created_at'] = _time.time()
+        user_sessions[user_id] = existing
+
+def get_session(user_id):
+    """Thread-safe session getter - returns a COPY"""
+    with _session_lock:
+        return dict(user_sessions.get(user_id, {}))
+
+def clear_session(user_id):
+    """Thread-safe session removal"""
+    with _session_lock:
+        user_sessions.pop(user_id, None)
+
+def has_session(user_id):
+    """Thread-safe session existence check"""
+    with _session_lock:
+        return user_id in user_sessions
+
+def update_session_field(user_id, key, value):
+    """Thread-safe single field update"""
+    with _session_lock:
+        if user_id not in user_sessions:
+            user_sessions[user_id] = {'_created_at': _time.time()}
+        user_sessions[user_id][key] = value
 
 # Server status (runtime - disabled servers)
 disabled_servers = set()
@@ -88,7 +143,7 @@ SERVERS = {}
 
 def load_servers():
     """Load servers from config.py and merge with database servers"""
-    global SERVERS
+    global SERVERS, disabled_servers
     
     # Start with config servers
     SERVERS = dict(CONFIG_SERVERS)
@@ -103,8 +158,14 @@ def load_servers():
             else:
                 # Update existing with database settings if needed
                 SERVERS[server_id]['from_database'] = True
+            
+            # Restore disabled state from database
+            if server_data.get('is_active') == False:
+                disabled_servers.add(server_id)
                 
         logger.info(f"📡 Servers loaded: {len(CONFIG_SERVERS)} from config + {len(db_servers)} from database = {len(SERVERS)} total")
+        if disabled_servers:
+            logger.info(f"🔴 Disabled servers: {', '.join(disabled_servers)}")
     except Exception as e:
         logger.error(f"Error loading database servers: {e}")
         # Keep using config servers only
@@ -214,9 +275,20 @@ def check_channel_membership(user_id):
         return member.status in ['creator', 'administrator', 'member', 'restricted']
     except telebot.apihelper.ApiTelegramException as e:
         if "bot is not a member" in str(e).lower() or "chat not found" in str(e).lower():
-            logger.error(f"Bot is not admin in channel {REQUIRED_CHANNEL_ID}. Please add bot as admin!")
-            # Return True temporarily if bot can't check (admin needs to add bot to channel)
-            return True  # Allow access if bot can't verify
+            logger.error(f"⚠️ Bot is not admin in channel {REQUIRED_CHANNEL_ID}. Please add bot as admin!")
+            # Fail closed - don't allow access if bot can't verify membership
+            try:
+                bot.send_message(
+                    ADMIN_CHAT_ID,
+                    f"⚠️ *Channel Verification Error*\n\n"
+                    f"Bot is not admin in required channel!\n"
+                    f"Channel ID: `{REQUIRED_CHANNEL_ID}`\n\n"
+                    f"Please add bot as admin to the channel.",
+                    parse_mode='Markdown'
+                )
+            except:
+                pass
+            return False
         logger.warning(f"Telegram API error checking membership for {user_id}: {e}")
         return False
     except Exception as e:
@@ -249,10 +321,7 @@ def server_keyboard(for_free=False):
         # Skip disabled servers
         if server_id in disabled_servers:
             continue
-        # Add panel type indicator
-        panel_type = server.get('panel_type', 'xui').upper()
-        panel_icon = '🔷' if panel_type == 'HIDDIFY' else '🔸'
-        server_name = f"{server['name']} {panel_icon}"
+        server_name = server['name']
         callback_data = f"free_server_{server_id}" if for_free else f"server_{server_id}"
         markup.add(types.InlineKeyboardButton(server_name, callback_data=callback_data))
     markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="main_menu"))
@@ -398,10 +467,9 @@ def server_management_keyboard():
 
 def add_server_type_keyboard():
     """Server type selection keyboard"""
-    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(
-        types.InlineKeyboardButton("🖥️ 3X-UI Panel", callback_data="add_server_xui"),
-        types.InlineKeyboardButton("🌐 Hiddify Panel", callback_data="add_server_hiddify")
+        types.InlineKeyboardButton("🖥️ 3X-UI Panel", callback_data="add_server_xui")
     )
     markup.add(types.InlineKeyboardButton("❌ Cancel", callback_data="admin_servers"))
     return markup
@@ -673,6 +741,7 @@ def broadcast_command(message):
     users = get_all_users()
     
     sent = 0
+    failed = 0
     for user in users:
         try:
             bot.send_message(
@@ -680,10 +749,15 @@ def broadcast_command(message):
                 f"📢 *Announcement*\n\n{broadcast_message}"
             )
             sent += 1
+            # Telegram rate limit: ~30 msg/sec
+            if sent % 25 == 0:
+                import time as _t
+                _t.sleep(1)
         except Exception as e:
+            failed += 1
             logger.error(f"Failed to send to {user[1]}: {e}")
     
-    bot.reply_to(message, f"✅ Broadcast sent to {sent}/{len(users)} users")
+    bot.reply_to(message, f"✅ Broadcast sent to {sent}/{len(users)} users ({failed} failed)")
 
 @bot.message_handler(commands=['backup'])
 def backup_command(message):
@@ -700,6 +774,116 @@ def backup_command(message):
         bot.reply_to(message, "✅ Backup created and sent to Payment Channel!")
     else:
         bot.reply_to(message, "❌ Backup failed! Check logs for details.")
+
+@bot.message_handler(commands=['freekeys'])
+def freekeys_command(message):
+    """Show free key stats and conversion data"""
+    user_id = message.from_user.id
+    
+    if user_id != ADMIN_CHAT_ID:
+        SecurityLogger.log_failed_auth(user_id, "freekeys_command")
+        return
+    
+    # Parse subcommand
+    parts = message.text.split()
+    subcmd = parts[1] if len(parts) > 1 else 'summary'
+    
+    if subcmd == 'list':
+        # Detailed list of all free key users
+        stats = get_free_test_stats()
+        if not stats:
+            bot.reply_to(message, "📊 Free Key ကို ဘယ်သူမှ မသုံးပါးသေးပါ။")
+            return
+        
+        text = "🆓 *Free Key Users (သေးစိတ်စာရင်း)*\n\n"
+        for i, row in enumerate(stats[:30], 1):
+            tid, used_at, srv, proto, uname, tg_uname, first_name = row
+            display = tg_uname or first_name or f"User\\_{tid}"
+            display = str(display).replace('_', '\\_')
+            srv_name = SERVERS.get(srv, {}).get('name', srv or '-') if srv else '-'
+            proto_str = proto or '-'
+            text += f"{i}. @{display} (`{tid}`)\n"
+            text += f"   📅 {used_at}\n"
+            text += f"   🖥️ {srv_name} | 🔐 {proto_str}\n\n"
+        
+        if len(stats) > 30:
+            text += f"\n_...{len(stats) - 30} ယောက် ကျန်ပါသေးအုပ်_"
+        text += f"\n📊 စုစုပေါင်း: {len(stats)} ယောက်"
+        
+        bot.reply_to(message, text, parse_mode='Markdown')
+    
+    elif subcmd == 'convert':
+        # Conversion tracking - who purchased after free key
+        data = get_free_key_conversions()
+        if not data:
+            bot.reply_to(message, "📊 Data မရှိသေးပါ။")
+            return
+        
+        total = len(data)
+        converted = sum(1 for r in data if r[6] and r[6] > 0)
+        rate = (converted / total * 100) if total > 0 else 0
+        total_revenue = sum(r[7] or 0 for r in data)
+        
+        text = "📈 *Free Key → Paid Conversion*\n\n"
+        text += f"🆓 Free Key သုံးသူ: {total} ယောက်\n"
+        text += f"💰 ဝယ်ယူသူ: {converted} ယောက်\n"
+        text += f"📈 Conversion Rate: {rate:.1f}%\n"
+        text += f"💵 Total Revenue: {total_revenue:,.0f} Ks\n\n"
+        
+        if converted > 0:
+            text += "*ဝယ်ယူသူများ:*\n"
+            for row in data[:20]:
+                tid, used_at, srv, proto, uname, fname, orders, spent, first_buy = row
+                if orders and orders > 0:
+                    display = uname or fname or f"User\\_{tid}"
+                    display = str(display).replace('_', '\\_')
+                    text += f"✅ @{display} - {orders} orders, {spent:,.0f} Ks\n"
+        
+        text += "\n*မဝယ်သေးသူများ:*\n"
+        not_converted = [r for r in data if not r[6] or r[6] == 0]
+        for row in not_converted[:10]:
+            tid, used_at, srv, proto, uname, fname, orders, spent, first_buy = row
+            display = uname or fname or f"User\\_{tid}"
+            display = str(display).replace('_', '\\_')
+            text += f"❌ @{display} (`{tid}`)\n"
+        if len(not_converted) > 10:
+            text += f"_...{len(not_converted) - 10} ယောက် ကျန်ပါသေးအုပ်_\n"
+        
+        bot.reply_to(message, text, parse_mode='Markdown')
+    
+    elif subcmd == 'servers':
+        # Server/protocol breakdown
+        srv_stats = get_free_key_server_stats()
+        if not srv_stats:
+            bot.reply_to(message, "📊 Server data မရှိသေးပါ။ (အသစ် server/protocol tracking မရှိသေးပါ)")
+            return
+        
+        text = "🖥️ *Free Key - Server/Protocol Breakdown*\n\n"
+        for srv_id, proto, count in srv_stats:
+            srv_name = SERVERS.get(srv_id, {}).get('name', srv_id or 'Unknown')
+            text += f"• {srv_name} | {proto}: {count} keys\n"
+        
+        bot.reply_to(message, text, parse_mode='Markdown')
+    
+    else:
+        # Summary
+        data = get_free_key_conversions()
+        total = len(data) if data else 0
+        converted = sum(1 for r in data if r[6] and r[6] > 0) if data else 0
+        rate = (converted / total * 100) if total > 0 else 0
+        total_revenue = sum(r[7] or 0 for r in data) if data else 0
+        
+        text = "🆓 *Free Key Summary*\n\n"
+        text += f"👤 စုစုပေါင်း သုံးသူ: {total} ယောက်\n"
+        text += f"💰 Conversion Rate: {rate:.1f}% ({converted}/{total})\n"
+        text += f"💵 Total Revenue: {total_revenue:,.0f} Ks\n\n"
+        text += "*Commands:*\n"
+        text += "• `/freekeys list` - အသေးစိတ် စာရင်း\n"
+        text += "• `/freekeys convert` - ဝယ်ယူသူ/မဝယ်သူ အချက်အလက်\n"
+        text += "• `/freekeys servers` - Server/Protocol breakdown\n"
+        
+        bot.reply_to(message, text, parse_mode='Markdown')
+
 
 @bot.callback_query_handler(func=lambda call: True)
 def button_callback(call):
@@ -749,7 +933,7 @@ def button_callback(call):
         # Check if feature is enabled
         if not feature_flags.get('free_test_key', True):
             bot.edit_message_text(
-                "🚫 *Free Test Key ယယက္ခံ ပိတ်ထားပါသည်။*\n\nကျေးဇူးပြု၍ VPN Key ဝယ်ယူပါ။",
+                "🚫 *Free Test Key ယာယီ ပိတ်ထားပါသည်။*\n\nကျေးဇူးပြု၍ VPN Key ဝယ်ယူပါ။",
                 call.message.chat.id,
                 call.message.message_id,
                 reply_markup=main_menu_keyboard()
@@ -816,7 +1000,7 @@ def button_callback(call):
         # Check if feature is enabled
         if not feature_flags.get('free_test_key', True):
             bot.edit_message_text(
-                "🚫 *Free Test Key ယယက္ခံ ပိတ်ထားပါသည်။*\n\nကျေးဇူးပြု၍ VPN Key ဝယ်ယူပါ။",
+                "🚫 *Free Test Key ယာယီ ပိတ်ထားပါသည်။*\n\nကျေးဇူးပြု၍ VPN Key ဝယ်ယူပါ။",
                 call.message.chat.id,
                 call.message.message_id,
                 reply_markup=main_menu_keyboard()
@@ -840,7 +1024,7 @@ def button_callback(call):
                 reply_markup=server_keyboard(for_free=True)
             )
     
-    # Free server selection - now goes to protocol selection (skip for Hiddify)
+    # Free server selection - goes to protocol selection
     elif data.startswith("free_server_"):
         server_id = data.replace("free_server_", "")
         
@@ -850,83 +1034,9 @@ def button_callback(call):
             bot.answer_callback_query(call.id, "❌ Invalid server.", show_alert=True)
             return
         
-        user_sessions[user_id] = {'server_id': server_id, 'is_free': True}
+        set_session(user_id, {'server_id': server_id, 'is_free': True})
         
-        # Check if server is Hiddify - skip protocol selection
-        server_config = SERVERS.get(server_id, {})
-        if server_config.get('panel_type') == 'hiddify':
-            # Skip protocol selection for Hiddify - directly create key
-            username = call.from_user.username if call.from_user.username else call.from_user.first_name
-            existing_keys = get_user_keys(user_id)
-            key_number = len(existing_keys) + 1
-            
-            bot.edit_message_text(
-                "⏳ Key ဖန်တီးနေပါသည်...",
-                call.message.chat.id,
-                call.message.message_id
-            )
-            
-            # Create free test key for Hiddify (no protocol needed)
-            result = create_vpn_key(
-                server_id=server_id,
-                telegram_id=user_id,
-                username=username,
-                data_limit_gb=3,  # 3GB limit
-                expiry_days=3,    # 72 hours
-                devices=1,
-                protocol='hiddify',  # Hiddify handles protocols automatically
-                key_number=key_number
-            )
-            
-            if result and result.get('success'):
-                mark_free_test_used(user_id)
-                config_link = result.get('config_link', result['sub_link'])
-                save_vpn_key(
-                    telegram_id=user_id,
-                    order_id=None,
-                    server_id=server_id,
-                    client_email=result['client_email'],
-                    client_id=result['client_id'],
-                    sub_link=result['sub_link'],
-                    config_link=config_link,
-                    data_limit=3,
-                    expiry_date=result['expiry_date']
-                )
-                
-                expiry_str = result['expiry_date'].strftime('%Y-%m-%d %H:%M')
-                message_text = MESSAGES['key_generated'].format(
-                    server=SERVERS[server_id]['name'],
-                    plan="🎁 Free Test",
-                    expiry=expiry_str,
-                    data_limit="3 GB",
-                    config_link=config_link,
-                    sub_link=result['sub_link']
-                )
-                
-                markup = types.InlineKeyboardMarkup(row_width=2)
-                markup.add(
-                    types.InlineKeyboardButton("🛒 Key ထပ်ဝယ်ရန်", callback_data="buy_key"),
-                    types.InlineKeyboardButton("📞 Admin ဆက်သွယ်ရန်", url="https://t.me/blackc0der404")
-                )
-                markup.add(types.InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu"))
-                
-                bot.edit_message_text(
-                    message_text,
-                    call.message.chat.id,
-                    call.message.message_id,
-                    reply_markup=markup,
-                    disable_web_page_preview=True
-                )
-            else:
-                bot.edit_message_text(
-                    "❌ Key ဖန်တီးရာတွင် အမှားရှိပါသည်။ ကျေးဇူးပြု၍ နောက်မှ ထပ်ကြိုးစားပါ။",
-                    call.message.chat.id,
-                    call.message.message_id,
-                    reply_markup=main_menu_keyboard()
-                )
-            return
-        
-        # XUI panel - show protocol selection
+        # Show protocol selection
         bot.edit_message_text(
             "🔐 *Protocol ရွေးချယ်ပါ:*\n\n_⭐ ပြထားသော Protocol သည် အကောင်းဆုံး ဖြစ်ပါသည်_",
             call.message.chat.id,
@@ -966,7 +1076,7 @@ def button_callback(call):
         )
         
         if result and result.get('success'):
-            mark_free_test_used(user_id)
+            mark_free_test_used(user_id, server_id=server_id, protocol=protocol, username=username)
             config_link = result.get('config_link', result['sub_link'])
             save_vpn_key(
                 telegram_id=user_id,
@@ -1022,7 +1132,7 @@ def button_callback(call):
             reply_markup=server_keyboard(for_free=False)
         )
     
-    # Server selected for purchase - go to protocol selection (skip for Hiddify)
+    # Server selected for purchase - go to protocol selection
     elif data.startswith("server_") and not data.startswith("server_selection"):
         server_id = data.replace("server_", "")
         
@@ -1032,23 +1142,9 @@ def button_callback(call):
             bot.answer_callback_query(call.id, "❌ Invalid server.", show_alert=True)
             return
         
-        user_sessions[user_id] = {'server_id': server_id}
+        set_session(user_id, {'server_id': server_id})
         
-        # Check if server is Hiddify - skip protocol selection
-        server_config = SERVERS.get(server_id, {})
-        if server_config.get('panel_type') == 'hiddify':
-            # Skip protocol selection for Hiddify - go directly to device selection
-            user_sessions[user_id]['protocol'] = 'hiddify'  # Hiddify handles protocols
-            
-            bot.edit_message_text(
-                "📱 *Device အရေအတွက် ရွေးချယ်ပါ:*\n\n_Device များများ သုံးလိုပါက များများ ရွေးပါ_",
-                call.message.chat.id,
-                call.message.message_id,
-                reply_markup=plan_keyboard(server_id)
-            )
-            return
-        
-        # XUI panel - show protocol selection
+        # Show protocol selection
         bot.edit_message_text(
             "🔐 *Protocol ရွေးချယ်ပါ:*\n\n_⭐ ပြထားသော Protocol သည် အကောင်းဆုံး ဖြစ်ပါသည်_",
             call.message.chat.id,
@@ -1062,9 +1158,7 @@ def button_callback(call):
         server_id = parts[0]
         protocol = parts[1] if len(parts) > 1 else 'trojan'
         
-        user_sessions[user_id] = user_sessions.get(user_id, {})
-        user_sessions[user_id]['server_id'] = server_id
-        user_sessions[user_id]['protocol'] = protocol
+        set_session(user_id, {'server_id': server_id, 'protocol': protocol})
         
         bot.edit_message_text(
             "📱 *Device အရေအတွက် ရွေးချယ်ပါ:*\n\n_Device များများ သုံးလိုပါက များများ ရွေးပါ_",
@@ -1079,8 +1173,7 @@ def button_callback(call):
         server_id = parts[0]
         device_count = parts[1] if len(parts) > 1 else '1'
         
-        user_sessions[user_id] = user_sessions.get(user_id, {})
-        user_sessions[user_id]['device_count'] = device_count
+        set_session(user_id, {'device_count': device_count})
         
         bot.edit_message_text(
             f"📅 *{device_count} Device အတွက် ကာလ ရွေးချယ်ပါ:*\n\n_ကာလ ကြာကြာ ဝယ်လေ စျေးသက်သာလေ_",
@@ -1112,19 +1205,19 @@ def button_callback(call):
             return
         
         # Keep existing session data and add new data
-        existing_session = user_sessions.get(user_id, {})
+        existing_session = get_session(user_id)
         protocol = existing_session.get('protocol', 'trojan')
         
-        user_sessions[user_id] = {
+        set_session(user_id, {
             'server_id': server_id,
             'plan_id': plan_id,
             'amount': plan['price'],
             'protocol': protocol
-        }
+        })
         
         # Create order with protocol
         order_id = create_order(user_id, server_id, plan_id, plan['price'], protocol)
-        user_sessions[user_id]['order_id'] = order_id
+        update_session_field(user_id, 'order_id', order_id)
         
         # Show payment info
         payment_text = MESSAGES['payment_info'].format(amount=plan['price'])
@@ -1145,12 +1238,10 @@ def button_callback(call):
     # Send screenshot prompt
     elif data.startswith("send_screenshot_"):
         order_id = data.replace("send_screenshot_", "")
-        user_sessions[user_id] = user_sessions.get(user_id, {})
-        user_sessions[user_id]['waiting_screenshot'] = True
-        user_sessions[user_id]['order_id'] = int(order_id)
+        set_session(user_id, {'waiting_screenshot': True, 'order_id': int(order_id)})
         
         bot.edit_message_text(
-            "📸 *Payment Screenshot ပိုပေးပါ*\n\nScreenshot ကို ဤနေရာတွင် ယခု ပို့ပေးပါ။",
+            "📸 *Payment Screenshot ပို့ပေးပါ*\n\nScreenshot ကို ဤနေရာတွင် ယခု ပို့ပေးပါ။",
             call.message.chat.id,
             call.message.message_id
         )
@@ -1201,100 +1292,67 @@ def button_callback(call):
             for i, (key, client_info) in enumerate(valid_keys, 1):
                 server_id = key[3]
                 server_name = SERVERS.get(server_id, {}).get('name', 'Unknown')
-                panel_type = SERVERS.get(server_id, {}).get('panel_type', 'xui')
                 
                 # Get expiry from panel (in milliseconds)
                 client = client_info['client']
                 inbound = client_info['inbound']
                 protocol = inbound.get('protocol', 'trojan')
                 
-                # Handle Hiddify panel differently
-                if panel_type == 'hiddify' or protocol == 'hiddify':
-                    # For Hiddify, use stored subscription link
-                    sub_link = key[6] if len(key) > 6 else None  # sub_link column
-                    config_link = key[7] if len(key) > 7 else sub_link  # config_link column
-                    
-                    # Get expiry from hiddify_user data
-                    hiddify_user = client_info.get('hiddify_user', {})
-                    package_days = hiddify_user.get('package_days', 0)
-                    start_date = hiddify_user.get('start_date')
-                    
-                    if start_date and package_days:
-                        from datetime import timedelta
-                        try:
-                            if isinstance(start_date, str):
-                                start = datetime.strptime(start_date[:10], '%Y-%m-%d')
-                            else:
-                                start = start_date
-                            expiry = start + timedelta(days=package_days)
-                            days_left = (expiry - datetime.now()).days
-                            expiry_display = f"{expiry.strftime('%Y-%m-%d')} ({days_left} days left)"
-                        except:
-                            expiry_display = f"{package_days} days package"
-                    else:
-                        expiry_display = "Active"
-                    
-                    text += f"*Key {i}:*\n"
-                    text += f"├ Server: {server_name}\n"
-                    text += f"├ Type: Hiddify (Multi-Protocol)\n"
-                    text += f"├ Expiry: {expiry_display}\n"
-                    text += f"└ Subscription Link:\n`{sub_link or config_link}`\n\n"
+                # XUI Panel handling
+                panel_expiry_ms = client.get('expiryTime', 0)
+                
+                if panel_expiry_ms > 0:
+                    panel_expiry = datetime.fromtimestamp(panel_expiry_ms / 1000)
+                    expiry_str = panel_expiry.strftime('%Y-%m-%d %H:%M')
+                    days_left = (panel_expiry - datetime.now()).days
+                    expiry_display = f"{expiry_str} ({days_left} days left)"
                 else:
-                    # XUI Panel handling
-                    panel_expiry_ms = client.get('expiryTime', 0)
-                    
-                    if panel_expiry_ms > 0:
-                        panel_expiry = datetime.fromtimestamp(panel_expiry_ms / 1000)
-                        expiry_str = panel_expiry.strftime('%Y-%m-%d %H:%M')
-                        days_left = (panel_expiry - datetime.now()).days
-                        expiry_display = f"{expiry_str} ({days_left} days left)"
-                    else:
-                        expiry_display = "Unlimited"
-                    
-                    # Get protocol and generate config link
-                    port = inbound.get('port', 443)
-                    server_domain = SERVERS.get(server_id, {}).get('domain', '')
-                    
-                    # Generate config link based on protocol
-                    if protocol == 'trojan':
-                        client_uuid = client.get('password')
-                        # Use custom trojan_port if configured, otherwise use inbound port
-                        trojan_port = SERVERS.get(server_id, {}).get('trojan_port', port)
-                        config_link = f"trojan://{client_uuid}@{server_domain}:{trojan_port}?security=none&type=tcp#{client.get('email')}"
-                    elif protocol == 'vless':
-                        client_uuid = client.get('id')
-                        config_link = f"vless://{client_uuid}@{server_domain}:{port}?type=tcp&security=none#{client.get('email')}"
-                    elif protocol == 'vmess':
-                        import base64
-                        import json as json_lib
-                        client_uuid = client.get('id')
-                        vmess_config = {
-                            "v": "2",
-                            "ps": client.get('email'),
-                            "add": server_domain,
-                            "port": str(port),
-                            "id": client_uuid,
-                            "aid": "0",
-                            "net": "tcp",
-                            "type": "none",
-                            "tls": ""
-                        }
-                        config_link = "vmess://" + base64.b64encode(json_lib.dumps(vmess_config).encode()).decode()
-                    elif protocol == 'shadowsocks':
-                        import base64
-                        ss_settings = json.loads(inbound.get('settings', '{}'))
-                        method = ss_settings.get('method', 'aes-256-gcm')
-                        password = client.get('password', client.get('id'))
-                        ss_auth = base64.b64encode(f"{method}:{password}".encode()).decode()
-                        config_link = f"ss://{ss_auth}@{server_domain}:{port}#{client.get('email')}"
-                    else:
-                        config_link = key[7] if key[7] else key[6]  # Fallback to database
-                    
-                    text += f"*Key {i}:*\n"
-                    text += f"├ Server: {server_name}\n"
-                    text += f"├ Protocol: {protocol.upper()}\n"
-                    text += f"├ Expiry: {expiry_display}\n"
-                    text += f"└ Key:\n`{config_link}`\n\n"
+                    expiry_display = "Unlimited"
+                
+                # Get protocol and generate config link
+                port = inbound.get('port', 443)
+                server_domain = SERVERS.get(server_id, {}).get('domain', '')
+                
+                # Generate config link based on protocol
+                if protocol == 'trojan':
+                    client_uuid = client.get('password')
+                    # Use custom trojan_port if configured, otherwise use inbound port
+                    trojan_port = SERVERS.get(server_id, {}).get('trojan_port', port)
+                    config_link = f"trojan://{client_uuid}@{server_domain}:{trojan_port}?security=none&type=tcp#{client.get('email')}"
+                elif protocol == 'vless':
+                    client_uuid = client.get('id')
+                    config_link = f"vless://{client_uuid}@{server_domain}:{port}?type=tcp&security=none#{client.get('email')}"
+                elif protocol == 'vmess':
+                    import base64
+                    import json as json_lib
+                    client_uuid = client.get('id')
+                    vmess_config = {
+                        "v": "2",
+                        "ps": client.get('email'),
+                        "add": server_domain,
+                        "port": str(port),
+                        "id": client_uuid,
+                        "aid": "0",
+                        "net": "tcp",
+                        "type": "none",
+                        "tls": ""
+                    }
+                    config_link = "vmess://" + base64.b64encode(json_lib.dumps(vmess_config).encode()).decode()
+                elif protocol == 'shadowsocks':
+                    import base64
+                    ss_settings = json.loads(inbound.get('settings', '{}'))
+                    method = ss_settings.get('method', 'aes-256-gcm')
+                    password = client.get('password', client.get('id'))
+                    ss_auth = base64.b64encode(f"{method}:{password}".encode()).decode()
+                    config_link = f"ss://{ss_auth}@{server_domain}:{port}#{client.get('email')}"
+                else:
+                    config_link = key[7] if key[7] else key[6]  # Fallback to database
+                
+                text += f"*Key {i}:*\n"
+                text += f"├ Server: {server_name}\n"
+                text += f"├ Protocol: {protocol.upper()}\n"
+                text += f"├ Expiry: {expiry_display}\n"
+                text += f"└ Key:\n`{config_link}`\n\n"
             
             text += "_Key ကို Long Press လုပ်ပြီး Copy ယူပါ_"
             
@@ -1344,7 +1402,7 @@ def button_callback(call):
         # Check if feature is enabled
         if not feature_flags.get('protocol_change', True):
             bot.edit_message_text(
-                "🚫 *Protocol Change ယယက္ခံ ပိတ်ထားပါသည်။*\n\nနောက်မှ ပြန်ဖွင့်ပါမည်။",
+                "🚫 *Protocol Change ယာယီ ပိတ်ထားပါသည်။*\n\nနောက်မှ ပြန်ဖွင့်ပါမည်။",
                 call.message.chat.id,
                 call.message.message_id,
                 reply_markup=main_menu_keyboard()
@@ -1405,9 +1463,7 @@ def button_callback(call):
             return
         
         server_id = key[3]
-        user_sessions[user_id] = user_sessions.get(user_id, {})
-        user_sessions[user_id]['exchange_key_id'] = key_id
-        user_sessions[user_id]['exchange_server_id'] = server_id
+        set_session(user_id, {'exchange_key_id': key_id, 'exchange_server_id': server_id})
         
         # Show protocol selection
         markup = types.InlineKeyboardMarkup(row_width=1)
@@ -1515,20 +1571,58 @@ def button_callback(call):
         
         if result and result.get('success'):
             config_link = result.get('config_link', result['sub_link'])
+            new_client_email = result['client_email']
             
             # Delete old key from 3x-ui panel AFTER successful creation
-            try:
-                delete_vpn_client(server_id, old_client_email)
-                logger.info(f"Deleted old key: {old_client_email}")
-            except Exception as e:
-                logger.error(f"Error deleting old key: {e}")
+            delete_success = False
+            for attempt in range(3):
+                try:
+                    delete_vpn_client(server_id, old_client_email)
+                    logger.info(f"Deleted old key: {old_client_email}")
+                    delete_success = True
+                    break
+                except Exception as e:
+                    logger.error(f"Delete old key attempt {attempt+1}/3 failed: {e}")
+                    _time.sleep(1)
+            
+            if not delete_success:
+                # Compensating action: delete the newly created key to avoid orphan
+                logger.error(f"⚠️ Failed to delete old key after 3 attempts. Rolling back new key creation.")
+                try:
+                    delete_vpn_client(server_id, new_client_email)
+                    logger.info(f"Rolled back new key: {new_client_email}")
+                except Exception as e:
+                    logger.error(f"Rollback also failed: {e}")
+                
+                # Notify admin
+                try:
+                    bot.send_message(
+                        ADMIN_CHAT_ID,
+                        f"⚠️ *Protocol Exchange Error*\n\n"
+                        f"User: `{user_id}`\n"
+                        f"Old key: `{old_client_email}`\n"
+                        f"New key: `{new_client_email}`\n\n"
+                        f"Delete old key failed 3x. Rolled back new key.\n"
+                        f"Manual cleanup may be needed on {server_id}.",
+                        parse_mode='Markdown'
+                    )
+                except:
+                    pass
+                
+                bot.edit_message_text(
+                    "❌ Protocol ပြောင်းရာတွင် အမှားရှိပါသည်။ Admin ကို ဆက်သွယ်ပါ။",
+                    call.message.chat.id,
+                    call.message.message_id,
+                    reply_markup=main_menu_keyboard()
+                )
+                return
             
             # Update database
             update_vpn_key(
                 key_id=key_id,
                 sub_link=result['sub_link'],
                 config_link=config_link,
-                client_email=result['client_email'],
+                client_email=new_client_email,
                 client_id=result['client_id']
             )
             
@@ -1608,7 +1702,7 @@ _Key အသစ်ကို App မှာ ပြန်ထည့်ပါ။_
         # Check if feature is enabled
         if not feature_flags.get('referral_system', True):
             bot.edit_message_text(
-                "🚫 *Referral System ယယက္ခံ ပိတ်ထားပါသည်။*\n\nနောက်မှ ပြန်ဖွင့်ပါမည်။",
+                "🚫 *Referral System ယာယီ ပိတ်ထားပါသည်။*\n\nနောက်မှ ပြန်ဖွင့်ပါမည်။",
                 call.message.chat.id,
                 call.message.message_id,
                 reply_markup=main_menu_keyboard()
@@ -1665,14 +1759,14 @@ _Key အသစ်ကို App မှာ ပြန်ထည့်ပါ။_
         existing_keys = get_user_keys(customer_id)
         key_number = len(existing_keys) + 1
         
-        # Create free key - Use first available server (prefer Hiddify, else first XUI server)
+        # Create free key - Use first available active server
         server_id = None
         for sid, server in SERVERS.items():
-            if server.get('panel_type') == 'hiddify':
+            if sid not in disabled_servers:
                 server_id = sid
                 break
         if not server_id:
-            server_id = list(SERVERS.keys())[0]  # First available server
+            server_id = list(SERVERS.keys())[0]  # Fallback to first server
         
         # Free key plan: 1 Month, 1 Device
         free_plan = {
@@ -1757,9 +1851,10 @@ _App မှာ Subscription Link ထည့်ပြီး အသုံးပြ�
                 parse_mode='Markdown'
             )
         else:
+            safe_name = str(customer_username).replace('_', '\\_')
             bot.edit_message_text(
                 f"❌ *Failed to create key*\n\n"
-                f"👤 User: @{customer_username} ({customer_id})\n"
+                f"👤 User: @{safe_name} ({customer_id})\n"
                 f"Error: {result.get('error', 'Unknown error') if result else 'No response'}",
                 call.message.chat.id,
                 call.message.message_id,
@@ -1865,6 +1960,7 @@ _App မှာ Subscription Link ထည့်ပြီး အသုံးပြ�
         # Get customer username
         customer = get_user(customer_id)
         customer_username = customer[2] if customer and customer[2] else f"User_{customer_id}"
+        customer_username_safe = str(customer_username).replace('_', '\\_')
         
         # Get current key count for this customer to determine key number
         existing_keys = get_user_keys(customer_id)
@@ -1932,7 +2028,7 @@ _App မှာ Subscription Link ထည့်ပြီး အသုံးပြ�
             # Update admin message with full order details
             bot.edit_message_caption(
                 caption=f"✅ *Order #{order_id} Approved!*\n\n"
-                        f"👤 User: @{customer_username} ({customer_id})\n"
+                        f"👤 User: @{customer_username_safe} ({customer_id})\n"
                         f"🖥️ Server: {SERVERS[server_id]['name']}\n"
                         f"📦 Plan: {plan['name']}\n"
                         f"💰 Amount: {plan['price']:,} Ks\n"
@@ -1947,7 +2043,7 @@ _App မှာ Subscription Link ထည့်ပြီး အသုံးပြ�
             bot.edit_message_caption(
                 caption=f"❌ *Failed to create key*\n\n"
                         f"Order #{order_id}\n"
-                        f"👤 User: @{customer_username} ({customer_id})\n"
+                        f"👤 User: @{customer_username_safe} ({customer_id})\n"
                         f"🖥️ Server: {SERVERS[server_id]['name']}\n"
                         f"📦 Plan: {plan['name']}\n"
                         f"💰 Amount: {plan['price']:,} Ks",
@@ -1988,6 +2084,7 @@ _App မှာ Subscription Link ထည့်ပြီး အသုံးပြ�
         # Get customer info
         customer = get_user(customer_id)
         customer_username = customer[2] if customer and customer[2] else f"User_{customer_id}"
+        customer_username_safe = str(customer_username).replace('_', '\\_')
         
         SecurityLogger.log_admin_action(user_id, "reject_order", f"order_id={order_id}")
         
@@ -2014,7 +2111,7 @@ _App မှာ Subscription Link ထည့်ပြီး အသုံးပြ�
         # Update admin message with full order details
         bot.edit_message_caption(
             caption=f"❌ *Order #{order_id} Rejected!*\n\n"
-                    f"👤 User: @{customer_username} ({customer_id})\n"
+                    f"👤 User: @{customer_username_safe} ({customer_id})\n"
                     f"🖥️ Server: {SERVERS.get(order_server_id, {}).get('name', 'Unknown')}\n"
                     f"📦 Plan: {plan.get('name', order_plan_id)}\n"
                     f"💰 Amount: {order_amount:,} Ks\n\n"
@@ -2161,7 +2258,7 @@ _App မှာ Subscription Link ထည့်ပြီး အသုံးပြ�
         if user_id != ADMIN_CHAT_ID:
             return
         
-        user_sessions[user_id] = {'action': 'add_server', 'panel_type': 'xui', 'step': 1}
+        set_session(user_id, {'action': 'add_server', 'panel_type': 'xui', 'step': 1})
         
         text = "🖥️ *Add 3X-UI Server*\n\n"
         text += "အောက်ပါ Format အတိုင်း Server Info ထည့်ပါ:\n\n"
@@ -2175,36 +2272,6 @@ _App မှာ Subscription Link ထည့်ပြီး အသုံးပြ�
         text += "```\n\n"
         text += "💡 Format:\n`server_id,name,url,panel_path,domain,sub_port`\n\n"
         text += "Example:\n`sg4,🇸🇬 Singapore 4,https://sg4.example.com:8080,/mka,sg4.example.com,2096`"
-        
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("❌ Cancel", callback_data="admin_servers"))
-        
-        bot.edit_message_text(
-            text,
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=markup
-        )
-    
-    elif data == "add_server_hiddify":
-        if user_id != ADMIN_CHAT_ID:
-            return
-        
-        user_sessions[user_id] = {'action': 'add_server', 'panel_type': 'hiddify', 'step': 1}
-        
-        text = "🌐 *Add Hiddify Server*\n\n"
-        text += "အောက်ပါ Format အတိုင်း Server Info ထည့်ပါ:\n\n"
-        text += "```\n"
-        text += "Server ID: hiddify2\n"
-        text += "Name: 🌐 Hiddify Server 2\n"
-        text += "URL: https://hiddify2.example.com\n"
-        text += "Admin Path: AdminUUID123\n"
-        text += "Domain: hiddify2.example.com\n"
-        text += "API Key: your-api-key\n"
-        text += "User Sub Path: UserSubPath\n"
-        text += "```\n\n"
-        text += "💡 Format:\n`server_id,name,url,admin_path,domain,api_key,user_sub_path`\n\n"
-        text += "Example:\n`hiddify2,🌐 Hiddify 2,https://h2.example.com,AdminPath,h2.example.com,api-key-here,UserSubPath`"
         
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("❌ Cancel", callback_data="admin_servers"))
@@ -2612,7 +2679,7 @@ _App မှာ Subscription Link ထည့်ပြီး အသုံးပြ�
         if user_id != ADMIN_CHAT_ID:
             return
         
-        user_sessions[user_id] = {'action': 'ban_user'}
+        set_session(user_id, {'action': 'ban_user'})
         
         text = "🚫 *Ban User*\n\n"
         text += "Ban လုပ်မည့် User ၏ Telegram ID ထည့်ပါ:\n\n"
@@ -2635,7 +2702,7 @@ _App မှာ Subscription Link ထည့်ပြီး အသုံးပြ�
         if user_id != ADMIN_CHAT_ID:
             return
         
-        user_sessions[user_id] = {'action': 'unban_user'}
+        set_session(user_id, {'action': 'unban_user'})
         
         text = "✅ *Unban User*\n\n"
         text += "Unban လုပ်မည့် User ၏ Telegram ID ထည့်ပါ:"
@@ -2754,7 +2821,7 @@ def handle_reply_keyboard_buttons(message):
         
     elif text == "🔗 Share Link":
         user = get_user(user_id)
-        ref_code = user[4] if user else None  # referral_code column
+        ref_code = user[9] if user and len(user) > 9 else None  # referral_code is column index 9
         if ref_code:
             ref_link = f"https://t.me/BurmeseDigitalStore_bot?start=REF_{ref_code}"
             msg_text = f"""
@@ -2791,7 +2858,13 @@ def handle_reply_keyboard_buttons(message):
             msg_text = "🔑 *သင့် VPN Keys:*\n\n"
             markup = types.InlineKeyboardMarkup(row_width=1)
             for i, key in enumerate(keys, 1):
-                key_id, order_id, server_id, client_email, sub_link, config_link, data_limit, expiry_date, created_at = key[:9]
+                # vpn_keys columns: id(0), telegram_id(1), order_id(2), server_id(3), 
+                # client_email(4), client_id(5), sub_link(6), config_link(7), 
+                # data_limit(8), expiry_date(9), is_active(10), created_at(11)
+                key_id = key[0]
+                server_id = key[3]
+                client_email = key[4]
+                expiry_date = key[9]
                 server_name = SERVERS.get(server_id, {}).get('name', 'Unknown')
                 expiry_str = expiry_date if isinstance(expiry_date, str) else expiry_date.strftime('%Y-%m-%d')
                 msg_text += f"*{i}. {server_name}*\nExpiry: {expiry_str}\n\n"
@@ -2861,125 +2934,72 @@ def handle_reply_keyboard_buttons(message):
 # ===================== ADMIN TEXT INPUT HANDLER =====================
 
 @bot.message_handler(func=lambda message: message.from_user.id == ADMIN_CHAT_ID and 
-                     message.from_user.id in user_sessions and 
-                     user_sessions.get(message.from_user.id, {}).get('action') in ['ban_user', 'unban_user', 'add_server'])
+                     has_session(message.from_user.id) and 
+                     get_session(message.from_user.id).get('action') in ['ban_user', 'unban_user', 'add_server'])
 def handle_admin_text_input(message):
     """Handle admin text input for ban/unban/add_server"""
     user_id = message.from_user.id
-    session = user_sessions.get(user_id, {})
+    session = get_session(user_id)
     action = session.get('action')
     
     # ==================== ADD SERVER ====================
     if action == 'add_server':
-        panel_type = session.get('panel_type', 'xui')
         text = message.text.strip()
         
         try:
             parts = [p.strip() for p in text.split(',')]
             
-            if panel_type == 'xui':
-                # Format: server_id,name,url,panel_path,domain,sub_port
-                if len(parts) < 5:
-                    bot.reply_to(message, "❌ Invalid format!\n\nFormat: `server_id,name,url,panel_path,domain,sub_port`", parse_mode='Markdown')
-                    return
+            # Format: server_id,name,url,panel_path,domain,sub_port
+            if len(parts) < 5:
+                bot.reply_to(message, "❌ Invalid format!\n\nFormat: `server_id,name,url,panel_path,domain,sub_port`", parse_mode='Markdown')
+                return
+            
+            server_id = parts[0].lower().replace(' ', '_')
+            name = parts[1]
+            url = parts[2]
+            panel_path = parts[3]
+            domain = parts[4]
+            sub_port = int(parts[5]) if len(parts) > 5 else 2096
+            
+            # Validate
+            if server_id in SERVERS:
+                bot.reply_to(message, f"❌ Server ID `{server_id}` already exists!", parse_mode='Markdown')
+                clear_session(user_id)
+                return
+            
+            # Add to database
+            if add_server(
+                server_id=server_id,
+                name=name,
+                url=url,
+                panel_path=panel_path,
+                domain=domain,
+                panel_type='xui',
+                sub_port=sub_port,
+                created_by=user_id
+            ):
+                # Reload servers
+                load_servers()
                 
-                server_id = parts[0].lower().replace(' ', '_')
-                name = parts[1]
-                url = parts[2]
-                panel_path = parts[3]
-                domain = parts[4]
-                sub_port = int(parts[5]) if len(parts) > 5 else 2096
-                
-                # Validate
-                if server_id in SERVERS:
-                    bot.reply_to(message, f"❌ Server ID `{server_id}` already exists!", parse_mode='Markdown')
-                    user_sessions.pop(user_id, None)
-                    return
-                
-                # Add to database
-                if add_server(
-                    server_id=server_id,
-                    name=name,
-                    url=url,
-                    panel_path=panel_path,
-                    domain=domain,
-                    panel_type='xui',
-                    sub_port=sub_port,
-                    created_by=user_id
-                ):
-                    # Reload servers
-                    load_servers()
-                    
-                    bot.reply_to(
-                        message,
-                        f"✅ *Server Added Successfully!*\n\n"
-                        f"🆔 ID: `{server_id}`\n"
-                        f"📛 Name: {name}\n"
-                        f"🌐 URL: {url}\n"
-                        f"🔧 Panel: 3X-UI\n"
-                        f"📍 Domain: {domain}\n"
-                        f"🔌 Sub Port: {sub_port}\n\n"
-                        f"Server ကို အသုံးပြုနိုင်ပါပြီ!",
-                        parse_mode='Markdown'
-                    )
-                else:
-                    bot.reply_to(message, "❌ Failed to add server! Please try again.")
-                    
-            elif panel_type == 'hiddify':
-                # Format: server_id,name,url,admin_path,domain,api_key,user_sub_path
-                if len(parts) < 6:
-                    bot.reply_to(message, "❌ Invalid format!\n\nFormat: `server_id,name,url,admin_path,domain,api_key,user_sub_path`", parse_mode='Markdown')
-                    return
-                
-                server_id = parts[0].lower().replace(' ', '_')
-                name = parts[1]
-                url = parts[2]
-                admin_path = parts[3]  # panel_path for Hiddify
-                domain = parts[4]
-                api_key = parts[5]
-                user_sub_path = parts[6] if len(parts) > 6 else admin_path
-                
-                # Validate
-                if server_id in SERVERS:
-                    bot.reply_to(message, f"❌ Server ID `{server_id}` already exists!", parse_mode='Markdown')
-                    user_sessions.pop(user_id, None)
-                    return
-                
-                # Add to database
-                if add_server(
-                    server_id=server_id,
-                    name=name,
-                    url=url,
-                    panel_path=admin_path,
-                    domain=domain,
-                    panel_type='hiddify',
-                    api_key=api_key,
-                    admin_uuid=api_key,
-                    proxy_path=admin_path,
-                    user_sub_path=user_sub_path,
-                    created_by=user_id
-                ):
-                    # Reload servers
-                    load_servers()
-                    
-                    bot.reply_to(
-                        message,
-                        f"✅ *Hiddify Server Added Successfully!*\n\n"
-                        f"🆔 ID: `{server_id}`\n"
-                        f"📛 Name: {name}\n"
-                        f"🌐 URL: {url}\n"
-                        f"🔧 Panel: Hiddify\n"
-                        f"📍 Domain: {domain}\n\n"
-                        f"Server ကို အသုံးပြုနိုင်ပါပြီ!",
-                        parse_mode='Markdown'
-                    )
-                else:
-                    bot.reply_to(message, "❌ Failed to add server! Please try again.")
+                bot.reply_to(
+                    message,
+                    f"✅ *Server Added Successfully!*\n\n"
+                    f"🆔 ID: `{server_id}`\n"
+                    f"📛 Name: {name}\n"
+                    f"🌐 URL: {url}\n"
+                    f"🔧 Panel: 3X-UI\n"
+                    f"📍 Domain: {domain}\n"
+                    f"🔌 Sub Port: {sub_port}\n\n"
+                    f"Server ကို အသုံးပြုနိုင်ပါပြီ!",
+                    parse_mode='Markdown'
+                )
+            else:
+                bot.reply_to(message, "❌ Failed to add server! Please try again.")
         
         except Exception as e:
             bot.reply_to(message, f"❌ Error: {str(e)}\n\nPlease check the format and try again.")
         
-        user_sessions.pop(user_id, None)
+        clear_session(user_id)
         return
     
     # ==================== BAN USER ====================
@@ -3043,7 +3063,7 @@ def handle_admin_text_input(message):
             bot.reply_to(message, "❌ Ban failed! Please try again.")
         
         # Clear session
-        user_sessions.pop(user_id, None)
+        clear_session(user_id)
     
     elif action == 'unban_user':
         try:
@@ -3056,7 +3076,7 @@ def handle_admin_text_input(message):
         ban_info = is_user_banned_db(target_id)
         if not ban_info:
             bot.reply_to(message, f"⚠️ User {target_id} is not banned.")
-            user_sessions.pop(user_id, None)
+            clear_session(user_id)
             return
         
         # Perform unban
@@ -3083,7 +3103,7 @@ def handle_admin_text_input(message):
             bot.reply_to(message, "❌ Unban failed! Please try again.")
         
         # Clear session
-        user_sessions.pop(user_id, None)
+        clear_session(user_id)
 
 @bot.message_handler(content_types=['photo'])
 def handle_photo(message):
@@ -3101,17 +3121,17 @@ def handle_photo(message):
         return
     
     # Debug: Log photo received
-    print(f"📷 Photo received from user {user_id}")
-    print(f"   Session exists: {user_id in user_sessions}")
-    if user_id in user_sessions:
-        print(f"   Waiting screenshot: {user_sessions[user_id].get('waiting_screenshot')}")
-        print(f"   Order ID: {user_sessions[user_id].get('order_id')}")
+    logger.debug(f"📷 Photo received from user {user_id}")
+    session = get_session(user_id)
+    logger.debug(f"   Session exists: {bool(session)}")
+    if session:
+        logger.debug(f"   Waiting screenshot: {session.get('waiting_screenshot')}")
+        logger.debug(f"   Order ID: {session.get('order_id')}")
     
-    if user_id not in user_sessions or not user_sessions[user_id].get('waiting_screenshot'):
+    if not session or not session.get('waiting_screenshot'):
         bot.reply_to(message, "⚠️ Order အရင်လုပ်ပြီးမှ Screenshot ပို့ပါ။\n\n🛒 Buy Key -> Server ရွေး -> Plan ရွေး -> Screenshot ပို့ပါ")
         return
     
-    session = user_sessions[user_id]
     order_id = session.get('order_id')
     
     if not order_id:
@@ -3121,7 +3141,7 @@ def handle_photo(message):
     # Check if order is already processed (prevent duplicate submissions)
     order = get_order(order_id)
     if order and order[6] != 'pending':  # status column
-        user_sessions[user_id]['waiting_screenshot'] = False
+        update_session_field(user_id, 'waiting_screenshot', False)
         bot.reply_to(message, 
             f"✅ *Order #{order_id} အတွက် Key ရပြီးသားပါ!*\n\n"
             "🔑 My Keys ကို နှိပ်ပြီး Key ကြည့်ပါ။",
@@ -3132,26 +3152,34 @@ def handle_photo(message):
     # Get photo file ID
     photo = message.photo[-1]  # Highest resolution
     file_id = photo.file_id
-    print(f"   File ID: {file_id[:30]}...")
+    logger.debug(f"   File ID: {file_id[:30]}...")
     
     # Security: Validate file size (max 10MB)
     if photo.file_size and photo.file_size > 10 * 1024 * 1024:
         bot.reply_to(message, "❌ File too large. Maximum size is 10MB.")
         return
     
-    # Skip abuse check for now - database compatibility issue
-    # try:
-    #     recent_orders = get_user_orders(user_id, limit=10)
-    #     should_block, _ = abuse_detector.check_order_pattern(user_id, recent_orders)
-    #     if should_block:
-    #         bot.reply_to(message, "⚠️ Too many submissions. Please wait before trying again.")
-    #         return
-    # except Exception as e:
-    #     print(f"   ⚠️ Abuse check error (skipped): {e}")
+    # Duplicate screenshot detection using file_unique_id
+    file_unique_id = photo.file_unique_id
+    try:
+        dup_order = is_duplicate_screenshot(file_unique_id, current_order_id=order_id)
+        if dup_order:
+            logger.warning(f"🚨 Duplicate screenshot detected! User {user_id}, file_unique_id={file_unique_id}, original order={dup_order}")
+            log_security_event(user_id, 'duplicate_screenshot', f'order={order_id} duplicate of order={dup_order}')
+            bot.reply_to(message, 
+                "❌ *Screenshot မှားယွင်း တွေ့ပါတယ်!*\n\n"
+                "အရင်သုံးပြီးသားသော screenshot ဖြစ်ပါသည်။ နောက်ထပ်စှာ payment လုပ်ပြီး screenshot အသစ်ပို့ပါ။",
+                parse_mode='Markdown',
+                reply_markup=main_menu_keyboard()
+            )
+            return
+    except Exception as e:
+        logger.error(f"Duplicate screenshot check error: {e}")
     
-    print(f"   Updating order {order_id} with screenshot...")
+    logger.debug(f"   Updating order {order_id} with screenshot...")
     # Update order with screenshot
     update_order_screenshot(order_id, file_id)
+    save_screenshot_unique_id(order_id, file_unique_id)
     
     # Get order details
     server_id = session.get('server_id')
@@ -3160,7 +3188,7 @@ def handle_photo(message):
     expected_amount = session.get('amount', 0)
     
     # Clear session
-    user_sessions[user_id]['waiting_screenshot'] = False
+    update_session_field(user_id, 'waiting_screenshot', False)
     
     # OCR Verification
     ocr_result = None
@@ -3519,22 +3547,26 @@ def process_referral_on_purchase(buyer_id, order_id):
         for key in active_keys:
             key_id, server_id, client_id, expiry_date = key
             server = SERVERS.get(server_id, {})
-            panel_type = server.get('panel_type', 'xui')
             
             try:
-                if panel_type == 'hiddify' and client_id:
-                    # Extend on Hiddify panel
-                    from hiddify_api import HiddifyApi
-                    api = HiddifyApi(server_id)
-                    new_expiry = api.extend_user_expiry(client_id, 5)
-                    if new_expiry:
-                        extend_key_expiry(key_id, 5)
-                        extended_keys.append((server['name'], new_expiry))
-                else:
-                    # Just extend in database for XUI (manual extend on panel needed)
-                    new_expiry = extend_key_expiry(key_id, 5)
-                    if new_expiry:
-                        extended_keys.append((server['name'], new_expiry))
+                # Extend in database
+                new_expiry = extend_key_expiry(key_id, 5)
+                if new_expiry:
+                    extended_keys.append((server.get('name', 'Unknown'), new_expiry))
+                    
+                    # Also extend on XUI panel
+                    try:
+                        from xui_api import XUIApi
+                        api = XUIApi(server_id)
+                        if api.login():
+                            # Get client_email from vpn_keys
+                            key_data = get_vpn_key_by_id(key_id)
+                            if key_data:
+                                client_email = key_data[4]  # client_email column
+                                api.extend_client_expiry(client_email, 5)
+                                logger.info(f"✅ Extended key {key_id} on XUI panel +5 days")
+                    except Exception as panel_err:
+                        logger.error(f"XUI panel extend failed for key {key_id}: {panel_err}")
             except Exception as e:
                 logger.error(f"Error extending key {key_id}: {e}")
         
@@ -3630,9 +3662,9 @@ def auto_approve_order(order_id):
             logger.error(f"Order #{order_id} not found for auto-approve")
             return
         
-        # Check if already approved
-        if order[6] != 'pending':  # status column
-            logger.info(f"Order #{order_id} already processed (status: {order[6]})")
+        # Check if already approved - use atomic operation to prevent race condition
+        if not approve_order_atomic(order_id, 0):  # 0 = auto-approve system
+            logger.info(f"Order #{order_id} already processed, skipping auto-approve")
             return
         
         customer_id = approval_data['customer_id']
@@ -3664,8 +3696,7 @@ def auto_approve_order(order_id):
         )
         
         if result and result.get('success'):
-            # Mark as approved (auto)
-            approve_order(order_id, 0)  # 0 = auto-approved
+            # Already approved atomically above
             
             config_link = result.get('config_link', result['sub_link'])
             save_vpn_key(
@@ -3811,8 +3842,9 @@ def log_auto_approval(order_id, customer_id, ocr_amount, result):
     try:
         # Log to security events for database record
         log_security_event(
+            customer_id,
             'AUTO_APPROVE',
-            f"Order #{order_id} auto-approved for user {customer_id}, amount: {ocr_amount} Ks, key: {result.get('client_email')}"
+            f"Order #{order_id} auto-approved, amount: {ocr_amount} Ks, key: {result.get('client_email')}"
         )
         # Note: Payment Channel message is already updated in auto_approve_order()
         # No need to send separate admin message
@@ -3920,6 +3952,115 @@ def schedule_next_backup():
     backup_timer.daemon = True
     backup_timer.start()
 
+# ===================== KEY EXPIRY REMINDERS =====================
+
+def check_expiring_keys():
+    """Check for keys expiring soon and send reminders"""
+    while True:
+        try:
+            _time.sleep(6 * 3600)  # Run every 6 hours
+            
+            # Keys expiring within 1 day
+            expiring_1d = get_expiring_keys(days=1)
+            # Keys expiring within 3 days (but more than 1 day)
+            expiring_3d = get_expiring_keys(days=3)
+            
+            sent_1d = 0
+            sent_3d = 0
+            
+            # Send urgent reminders (1 day)
+            for key in expiring_1d:
+                try:
+                    telegram_id = key[1]
+                    server_id = key[3]
+                    expiry_date = key[9]
+                    server_name = SERVERS.get(server_id, {}).get('name', server_id)
+                    
+                    # Parse expiry date
+                    if isinstance(expiry_date, str):
+                        try:
+                            exp_dt = datetime.strptime(expiry_date, '%Y-%m-%d %H:%M:%S')
+                        except:
+                            try:
+                                exp_dt = datetime.strptime(expiry_date, '%Y-%m-%d %H:%M:%S.%f')
+                            except:
+                                exp_dt = None
+                    else:
+                        exp_dt = expiry_date
+                    
+                    exp_str = exp_dt.strftime('%Y-%m-%d %H:%M') if exp_dt else str(expiry_date)
+                    
+                    bot.send_message(
+                        telegram_id,
+                        f"⚠️ *Key သက်တမ်းကုန်တော့မည်!*\n\n"
+                        f"🖥️ Server: {server_name}\n"
+                        f"📅 သက်တမ်းကုန်: {exp_str}\n\n"
+                        f"⏰ *24 နာရီအတွင်း* သက်တမ်းကုန်ပါတော့မည်!\n\n"
+                        f"🛒 Key အသစ်ဝယ်ယူရန် /start နှိပ်ပါ။",
+                        parse_mode='Markdown'
+                    )
+                    sent_1d += 1
+                    _time.sleep(0.5)  # Rate limit
+                except Exception as e:
+                    pass  # User may have blocked bot
+            
+            # Send advance reminders (3 days, excluding already-warned 1-day ones)
+            expiring_1d_ids = {k[0] for k in expiring_1d}
+            for key in expiring_3d:
+                if key[0] in expiring_1d_ids:
+                    continue  # Already sent urgent reminder
+                try:
+                    telegram_id = key[1]
+                    server_id = key[3]
+                    expiry_date = key[9]
+                    server_name = SERVERS.get(server_id, {}).get('name', server_id)
+                    
+                    if isinstance(expiry_date, str):
+                        try:
+                            exp_dt = datetime.strptime(expiry_date, '%Y-%m-%d %H:%M:%S')
+                        except:
+                            try:
+                                exp_dt = datetime.strptime(expiry_date, '%Y-%m-%d %H:%M:%S.%f')
+                            except:
+                                exp_dt = None
+                    else:
+                        exp_dt = expiry_date
+                    
+                    exp_str = exp_dt.strftime('%Y-%m-%d %H:%M') if exp_dt else str(expiry_date)
+                    
+                    bot.send_message(
+                        telegram_id,
+                        f"📢 *Key သက်တမ်းကုန်မည့်အကြောင်းအသိပေးချက်*\n\n"
+                        f"🖥️ Server: {server_name}\n"
+                        f"📅 သက်တမ်းကုန်: {exp_str}\n\n"
+                        f"💡 သက်တမ်းမကုန်ခင် Key အသစ်ဝယ်ယူပါ။\n"
+                        f"🛒 /start နှိပ်ပြီး Buy Key ကိုရွေးပါ။",
+                        parse_mode='Markdown'
+                    )
+                    sent_3d += 1
+                    _time.sleep(0.5)
+                except Exception as e:
+                    pass
+            
+            if sent_1d > 0 or sent_3d > 0:
+                logger.info(f"📢 Expiry reminders sent: {sent_1d} urgent (1d), {sent_3d} advance (3d)")
+                
+        except Exception as e:
+            logger.error(f"Expiry reminder error: {e}")
+
+# ===================== STALE ORDER CLEANUP =====================
+
+def cleanup_stale_orders():
+    """Periodically cancel stale pending orders (older than 24h)"""
+    while True:
+        try:
+            _time.sleep(3600)  # Run every hour
+            cancelled = cancel_stale_orders(hours=24)
+            if cancelled > 0:
+                logger.info(f"🗑️ Auto-cancelled {cancelled} stale pending orders")
+        except Exception as e:
+            logger.error(f"Stale order cleanup error: {e}")
+
 def run_midnight_backup():
     """Run midnight backup and schedule next one"""
     logger.info("🌙 Midnight backup starting...")
@@ -3972,42 +4113,93 @@ def main():
     
     rate_limiter.set_db_ban_callback(db_ban_wrapper)
     
+    # Setup server down alert callback
+    _alerted_servers = {}
+    def server_alert_handler(server_name, error_msg):
+        """Alert admin when XUI server is down (throttled to once per 30 min per server)"""
+        now = _time.time()
+        last_alert = _alerted_servers.get(server_name, 0)
+        if now - last_alert < 1800:  # 30 min cooldown
+            return
+        _alerted_servers[server_name] = now
+        try:
+            bot.send_message(
+                ADMIN_CHAT_ID,
+                f"🚨 *Server Down Alert*\n\n"
+                f"🖥️ Server: {server_name}\n"
+                f"❌ Error: {error_msg}\n\n"
+                f"⏰ {datetime.now(YANGON_TZ).strftime('%Y-%m-%d %H:%M MMT')}",
+                parse_mode='Markdown'
+            )
+        except:
+            pass
+    
+    set_server_alert_callback(server_alert_handler)
+    
     # Security initialization
-    print("🔒 Security features enabled:")
-    print("   ├ Rate limiting: ✅")
-    print("   ├ Input validation: ✅")
-    print("   ├ Callback validation: ✅")
-    print("   ├ Abuse detection: ✅")
-    print("   └ DDoS Auto-Block: ✅")
+    logger.info("🔒 Security features enabled:")
+    logger.info("   ├ Rate limiting: ✅")
+    logger.info("   ├ Input validation: ✅")
+    logger.info("   ├ Callback validation: ✅")
+    logger.info("   ├ Abuse detection: ✅")
+    logger.info("   └ DDoS Auto-Block: ✅")
     
     # Feature flags status
-    print("📋 Feature Flags:")
+    logger.info("📋 Feature Flags:")
     for flag_name, is_enabled in feature_flags.items():
         status = "✅" if is_enabled else "❌"
-        print(f"   ├ {flag_name}: {status}")
+        logger.debug(f"   ├ {flag_name}: {status}")
     
     # OCR and Auto-approve status
     if OCR_ENABLED:
-        print("🤖 OCR Payment Verification: ✅")
+        logger.info("🤖 OCR Payment Verification: ✅")
     else:
-        print("🤖 OCR Payment Verification: ❌")
+        logger.info("🤖 OCR Payment Verification: ❌")
     
     if AUTO_APPROVE_ENABLED:
-        print(f"⏱️ Auto-Approve: ✅ ({AUTO_APPROVE_TIMEOUT} seconds timeout)")
+        logger.info(f"⏱️ Auto-Approve: ✅ ({AUTO_APPROVE_TIMEOUT} seconds timeout)")
     else:
-        print("⏱️ Auto-Approve: ❌")
+        logger.info("⏱️ Auto-Approve: ❌")
+    
+    # Start session cleanup thread
+    session_cleaner = threading.Thread(target=cleanup_expired_sessions, daemon=True)
+    session_cleaner.start()
+    logger.info("🧹 Session Cleanup: ✅ (every 5 min)")
+    
+    # Start key expiry reminder thread
+    expiry_checker = threading.Thread(target=check_expiring_keys, daemon=True)
+    expiry_checker.start()
+    logger.info("📢 Key Expiry Reminders: ✅ (every 6 hours)")
+    
+    # Start stale order cleanup thread
+    stale_cleaner = threading.Thread(target=cleanup_stale_orders, daemon=True)
+    stale_cleaner.start()
+    logger.info("🗑️ Stale Order Cleanup: ✅ (every 1 hour, cancels 24h+ pending)")
     
     # Start auto backup scheduler
-    print("📦 Auto Backup: ✅ (Daily at 00:00 MMT)")
+    logger.info("📦 Auto Backup: ✅ (Daily at 00:00 MMT)")
     schedule_next_backup()
     
     # Start the bot
-    print("🚀 VPN Seller Bot started!")
-    print(f"📱 Bot: @{bot.get_me().username}")
-    print("Press Ctrl+C to stop")
+    logger.info("🚀 VPN Seller Bot started!")
+    logger.info(f"📱 Bot: @{bot.get_me().username}")
+    logger.info("Press Ctrl+C to stop")
     
-    # Start polling
-    bot.infinity_polling(skip_pending=True)
+    # Start polling with auto-reconnect
+    try:
+        bot.infinity_polling(
+            skip_pending=True,
+            timeout=60,
+            long_polling_timeout=30,
+            allowed_updates=["message", "callback_query", "chat_member"]
+        )
+    except KeyboardInterrupt:
+        logger.info("🛑 Bot stopping gracefully...")
+    except Exception as e:
+        logger.critical(f"Bot crashed: {e}")
+        raise
+    finally:
+        logger.info("Bot shutdown complete")
 
 if __name__ == '__main__':
     main()

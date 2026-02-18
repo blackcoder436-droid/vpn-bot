@@ -233,7 +233,6 @@ def extract_amount_from_text(text):
         r'(?:Transfer|transfer|Send|send|ငွေလွှဲ)[:\s]*(\d{1,3}(?:,\d{3})*|\d+)',
         # Generic large numbers (3000+) that could be amounts
         r'\b(\d{1,3}(?:,\d{3})+)\b',  # Numbers with commas like 3,000
-        r'\b([3-9]\d{3}|\d{5,})\b',  # Numbers 3000+ without commas
     ]
     
     amounts_found = []
